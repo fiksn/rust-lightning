@@ -15,6 +15,8 @@
 //! call into the provided message handlers (probably a ChannelManager and P2PGossipSync) with
 //! messages they should handle, and encoding/sending response messages.
 
+use rand::seq::SliceRandom;
+
 use bitcoin::blockdata::constants::ChainHash;
 use bitcoin::secp256k1::{self, Secp256k1, SecretKey, PublicKey};
 
@@ -2276,6 +2278,39 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 			if let Some(peer_mutex) = peer_opt {
 				self.do_disconnect(descriptor, &*peer_mutex.lock().unwrap(), "client request");
 			} else { debug_assert!(false, "node_id_to_descriptor thought we had a peer"); }
+		}
+	}
+
+	// TODO: those two methods are ugly AF, but I need them
+
+	/// Send data to a node given its node id.
+	///
+    pub fn send_to_node<M: wire::Type>(&self, node_id: PublicKey, message: &M) {
+		let descriptors = self.node_id_to_descriptor.lock().unwrap();
+		if let Some(descriptor) = descriptors.get(&node_id) {
+			let peers = self.peers.read().unwrap();
+
+			if let Some(peer) = peers.get(descriptor) {
+				let mut p = peer.lock().unwrap();
+				self.enqueue_message(&mut p, message);
+			}
+		}
+	}
+
+	/// Send data to a random node.
+	///
+    pub fn send_to_random_node<M: wire::Type>(&self, message: &M) {
+		let peers = self.peers.read().unwrap();
+
+		let keys: Vec<&Descriptor> = peers.keys().collect();
+		let mut rng = rand::thread_rng();
+
+		if let Some(random_key) = keys.choose(&mut rng) {
+			if let Some(peer) = peers.get(*random_key) {
+				let mut p = peer.lock().unwrap();
+				log_trace!(self.logger, "!!!!Enqueueing message {:?} to {}", message, log_pubkey!(p.their_node_id.unwrap().0));
+				self.enqueue_message(&mut p, message);
+			}
 		}
 	}
 

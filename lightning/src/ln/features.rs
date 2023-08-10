@@ -39,6 +39,8 @@
 //!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md) for more information).
 //! - `BasicMPP` - requires/supports that a node can receive basic multi-part payments
 //!     (see [BOLT-4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#basic-multi-part-payments) for more information).
+//! - `GossipQueriesEx` - requires/supports more sophisticated gossip control
+//!     (see [BOLT-7](https://github.com/lightning/bolts/blob/master/07-routing-gossip.md) for more information).
 //! - `Wumbo` - requires/supports that a node create large channels. Called `option_support_large_channel` in the spec.
 //!     (see [BOLT-2](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message) for more information).
 //! - `ShutdownAnySegwit` - requires/supports that future segwit versions are allowed in `shutdown`
@@ -139,7 +141,7 @@ mod sealed {
 		// Byte 0
 		DataLossProtect | InitialRoutingSync | UpfrontShutdownScript | GossipQueries,
 		// Byte 1
-		VariableLengthOnion | StaticRemoteKey | PaymentSecret,
+		VariableLengthOnion | StaticRemoteKey | PaymentSecret | GossipQueriesEx,
 		// Byte 2
 		BasicMPP | Wumbo | AnchorsNonzeroFeeHtlcTx | AnchorsZeroFeeHtlcTx,
 		// Byte 3
@@ -155,7 +157,7 @@ mod sealed {
 		// Byte 0
 		DataLossProtect | UpfrontShutdownScript | GossipQueries,
 		// Byte 1
-		VariableLengthOnion | StaticRemoteKey | PaymentSecret,
+		VariableLengthOnion | StaticRemoteKey | PaymentSecret | GossipQueriesEx,
 		// Byte 2
 		BasicMPP | Wumbo | AnchorsNonzeroFeeHtlcTx | AnchorsZeroFeeHtlcTx,
 		// Byte 3
@@ -373,6 +375,9 @@ mod sealed {
 		"Feature flags for `var_onion_optin`.", set_variable_length_onion_optional,
 		set_variable_length_onion_required, supports_variable_length_onion,
 		requires_variable_length_onion);
+	define_feature!(11, GossipQueriesEx, [InitContext, NodeContext],
+			"Feature flags for `gossip_queries_ex`.", set_gossip_queries_ex_optional, set_gossip_queries_ex_required,
+			supports_gossip_queries_ex, requires_gossip_queries_ex);
 	define_feature!(13, StaticRemoteKey, [InitContext, NodeContext, ChannelTypeContext],
 		"Feature flags for `option_static_remotekey`.", set_static_remote_key_optional,
 		set_static_remote_key_required, supports_static_remote_key, requires_static_remote_key);
