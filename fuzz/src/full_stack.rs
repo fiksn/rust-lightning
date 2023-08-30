@@ -34,18 +34,20 @@ use lightning::chain::chainmonitor;
 use lightning::chain::transaction::OutPoint;
 use lightning::sign::{InMemorySigner, Recipient, KeyMaterial, EntropySource, NodeSigner, SignerProvider};
 use lightning::events::Event;
-use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::ln::channelmanager::{ChainParameters, ChannelDetails, ChannelManager, PaymentId, RecipientOnionFields, Retry};
 use lightning::ln::peer_handler::{MessageHandler,PeerManager,SocketDescriptor,IgnoringMessageHandler};
 use lightning::ln::msgs::{self, DecodeError};
 use lightning::ln::script::ShutdownScript;
 use lightning::ln::functional_test_utils::*;
+use lightning::offers::invoice::UnsignedBolt12Invoice;
+use lightning::offers::invoice_request::UnsignedInvoiceRequest;
 use lightning::routing::gossip::{P2PGossipSync, NetworkGraph};
 use lightning::routing::utxo::UtxoLookup;
 use lightning::routing::router::{InFlightHtlcs, PaymentParameters, Route, RouteParameters, Router};
 use lightning::util::config::{UserConfig, MaxDustHTLCExposure};
 use lightning::util::errors::APIError;
-use lightning::util::enforcing_trait_impls::{EnforcingSigner, EnforcementState};
+use lightning::util::test_channel_signer::{TestChannelSigner, EnforcementState};
 use lightning::util::logger::Logger;
 use lightning::util::ser::{ReadableArgs, Writeable};
 
@@ -55,6 +57,7 @@ use crate::utils::test_persister::TestPersister;
 use bitcoin::secp256k1::{Message, PublicKey, SecretKey, Scalar, Secp256k1};
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
+use bitcoin::secp256k1::schnorr;
 
 use std::cell::RefCell;
 use hashbrown::{HashMap, hash_map};
@@ -177,13 +180,13 @@ impl<'a> std::hash::Hash for Peer<'a> {
 }
 
 type ChannelMan<'a> = ChannelManager<
-	Arc<chainmonitor::ChainMonitor<EnforcingSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
+	Arc<chainmonitor::ChainMonitor<TestChannelSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
 	Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<KeyProvider>, Arc<KeyProvider>, Arc<FuzzEstimator>, &'a FuzzRouter, Arc<dyn Logger>>;
 type PeerMan<'a> = PeerManager<Peer<'a>, Arc<ChannelMan<'a>>, Arc<P2PGossipSync<Arc<NetworkGraph<Arc<dyn Logger>>>, Arc<dyn UtxoLookup>, Arc<dyn Logger>>>, IgnoringMessageHandler, Arc<dyn Logger>, IgnoringMessageHandler, Arc<KeyProvider>>;
 
 struct MoneyLossDetector<'a> {
 	manager: Arc<ChannelMan<'a>>,
-	monitor: Arc<chainmonitor::ChainMonitor<EnforcingSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
+	monitor: Arc<chainmonitor::ChainMonitor<TestChannelSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
 	handler: PeerMan<'a>,
 
 	peers: &'a RefCell<[bool; 256]>,
@@ -197,7 +200,7 @@ struct MoneyLossDetector<'a> {
 impl<'a> MoneyLossDetector<'a> {
 	pub fn new(peers: &'a RefCell<[bool; 256]>,
 	           manager: Arc<ChannelMan<'a>>,
-	           monitor: Arc<chainmonitor::ChainMonitor<EnforcingSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
+	           monitor: Arc<chainmonitor::ChainMonitor<TestChannelSigner, Arc<dyn chain::Filter>, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<TestPersister>>>,
 	           handler: PeerMan<'a>) -> Self {
 		MoneyLossDetector {
 			manager,
@@ -316,6 +319,18 @@ impl NodeSigner for KeyProvider {
 		unreachable!()
 	}
 
+	fn sign_bolt12_invoice_request(
+		&self, _invoice_request: &UnsignedInvoiceRequest
+	) -> Result<schnorr::Signature, ()> {
+		unreachable!()
+	}
+
+	fn sign_bolt12_invoice(
+		&self, _invoice: &UnsignedBolt12Invoice,
+	) -> Result<schnorr::Signature, ()> {
+		unreachable!()
+	}
+
 	fn sign_gossip_message(&self, msg: lightning::ln::msgs::UnsignedGossipMessage) -> Result<Signature, ()> {
 		let msg_hash = Message::from_slice(&Sha256dHash::hash(&msg.encode()[..])[..]).map_err(|_| ())?;
 		let secp_ctx = Secp256k1::signing_only();
@@ -324,7 +339,7 @@ impl NodeSigner for KeyProvider {
 }
 
 impl SignerProvider for KeyProvider {
-	type Signer = EnforcingSigner;
+	type Signer = TestChannelSigner;
 
 	fn generate_channel_keys_id(&self, inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] {
 		let ctr = self.counter.fetch_add(1, Ordering::Relaxed) as u8;
@@ -336,7 +351,7 @@ impl SignerProvider for KeyProvider {
 		let secp_ctx = Secp256k1::signing_only();
 		let ctr = channel_keys_id[0];
 		let (inbound, state) = self.signer_state.borrow().get(&ctr).unwrap().clone();
-		EnforcingSigner::new_with_revoked(if inbound {
+		TestChannelSigner::new_with_revoked(if inbound {
 			InMemorySigner::new(
 				&secp_ctx,
 				SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, ctr]).unwrap(),
@@ -365,11 +380,11 @@ impl SignerProvider for KeyProvider {
 		}, state, false)
 	}
 
-	fn read_chan_signer(&self, mut data: &[u8]) -> Result<EnforcingSigner, DecodeError> {
+	fn read_chan_signer(&self, mut data: &[u8]) -> Result<TestChannelSigner, DecodeError> {
 		let inner: InMemorySigner = ReadableArgs::read(&mut data, self)?;
 		let state = Arc::new(Mutex::new(EnforcementState::new()));
 
-		Ok(EnforcingSigner::new_with_revoked(
+		Ok(TestChannelSigner::new_with_revoked(
 			inner,
 			state,
 			false
@@ -466,7 +481,7 @@ pub fn do_test(data: &[u8], logger: &Arc<dyn Logger>) {
 	let mut should_forward = false;
 	let mut payments_received: Vec<PaymentHash> = Vec::new();
 	let mut payments_sent = 0;
-	let mut pending_funding_generation: Vec<([u8; 32], PublicKey, u64, Script)> = Vec::new();
+	let mut pending_funding_generation: Vec<(ChannelId, PublicKey, u64, Script)> = Vec::new();
 	let mut pending_funding_signatures = HashMap::new();
 
 	loop {

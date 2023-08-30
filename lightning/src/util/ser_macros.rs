@@ -132,7 +132,20 @@ macro_rules! _check_encoded_tlv_order {
 /// [`Writer`]: crate::util::ser::Writer
 #[macro_export]
 macro_rules! encode_tlv_stream {
+	($stream: expr, {$(($type: expr, $field: expr, $fieldty: tt)),* $(,)*}) => {
+		$crate::_encode_tlv_stream!($stream, {$(($type, $field, $fieldty)),*})
+	}
+}
+
+/// Implementation of [`encode_tlv_stream`].
+/// This is exported for use by other exported macros, do not use directly.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! _encode_tlv_stream {
 	($stream: expr, {$(($type: expr, $field: expr, $fieldty: tt)),* $(,)*}) => { {
+		$crate::_encode_tlv_stream!($stream, { $(($type, $field, $fieldty)),* }, &[])
+	} };
+	($stream: expr, {$(($type: expr, $field: expr, $fieldty: tt)),* $(,)*}, $extra_tlvs: expr) => { {
 		#[allow(unused_imports)]
 		use $crate::{
 			ln::msgs::DecodeError,
@@ -144,6 +157,10 @@ macro_rules! encode_tlv_stream {
 		$(
 			$crate::_encode_tlv!($stream, $type, $field, $fieldty);
 		)*
+		for tlv in $extra_tlvs {
+			let (typ, value): &(u64, Vec<u8>) = tlv;
+			$crate::_encode_tlv!($stream, *typ, *value, required_vec);
+		}
 
 		#[allow(unused_mut, unused_variables, unused_assignments)]
 		#[cfg(debug_assertions)]
@@ -152,8 +169,12 @@ macro_rules! encode_tlv_stream {
 			$(
 				$crate::_check_encoded_tlv_order!(last_seen, $type, $fieldty);
 			)*
+			for tlv in $extra_tlvs {
+				let (typ, _): &(u64, Vec<u8>) = tlv;
+				$crate::_check_encoded_tlv_order!(last_seen, *typ, required_vec);
+			}
 		}
-	} }
+	} };
 }
 
 /// Adds the length of the serialized field to a [`LengthCalculatingWriter`].
@@ -210,18 +231,27 @@ macro_rules! _get_varint_length_prefixed_tlv_length {
 #[macro_export]
 macro_rules! _encode_varint_length_prefixed_tlv {
 	($stream: expr, {$(($type: expr, $field: expr, $fieldty: tt)),*}) => { {
+		$crate::_encode_varint_length_prefixed_tlv!($stream, {$(($type, $field, $fieldty)),*}, &[])
+	} };
+	($stream: expr, {$(($type: expr, $field: expr, $fieldty: tt)),*}, $extra_tlvs: expr) => { {
+		extern crate alloc;
 		use $crate::util::ser::BigSize;
+		use alloc::vec::Vec;
 		let len = {
 			#[allow(unused_mut)]
 			let mut len = $crate::util::ser::LengthCalculatingWriter(0);
 			$(
 				$crate::_get_varint_length_prefixed_tlv_length!(len, $type, $field, $fieldty);
 			)*
+			for tlv in $extra_tlvs {
+				let (typ, value): &(u64, Vec<u8>) = tlv;
+				$crate::_get_varint_length_prefixed_tlv_length!(len, *typ, *value, required_vec);
+			}
 			len.0
 		};
 		BigSize(len as u64).write($stream)?;
-		$crate::encode_tlv_stream!($stream, { $(($type, $field, $fieldty)),* });
-	} }
+		$crate::_encode_tlv_stream!($stream, { $(($type, $field, $fieldty)),* }, $extra_tlvs);
+	} };
 }
 
 /// Errors if there are missing required TLV types between the last seen type and the type currently being processed.
@@ -761,16 +791,35 @@ macro_rules! _init_tlv_field_var {
 
 /// Equivalent to running [`_init_tlv_field_var`] then [`read_tlv_fields`].
 ///
+/// If any unused values are read, their type MUST be specified or else `rustc` will read them as an
+/// `i64`.
+///
 /// This is exported for use by other exported macros, do not use directly.
 #[doc(hidden)]
 #[macro_export]
-macro_rules! _init_and_read_tlv_fields {
+macro_rules! _init_and_read_len_prefixed_tlv_fields {
 	($reader: ident, {$(($type: expr, $field: ident, $fieldty: tt)),* $(,)*}) => {
 		$(
 			$crate::_init_tlv_field_var!($field, $fieldty);
 		)*
 
 		$crate::read_tlv_fields!($reader, {
+			$(($type, $field, $fieldty)),*
+		});
+	}
+}
+
+/// Equivalent to running [`_init_tlv_field_var`] then [`decode_tlv_stream`].
+///
+/// If any unused values are read, their type MUST be specified or else `rustc` will read them as an
+/// `i64`.
+macro_rules! _init_and_read_tlv_stream {
+	($reader: ident, {$(($type: expr, $field: ident, $fieldty: tt)),* $(,)*}) => {
+		$(
+			$crate::_init_tlv_field_var!($field, $fieldty);
+		)*
+
+		$crate::decode_tlv_stream!($reader, {
 			$(($type, $field, $fieldty)),*
 		});
 	}
@@ -833,7 +882,7 @@ macro_rules! impl_writeable_tlv_based {
 
 		impl $crate::util::ser::Readable for $st {
 			fn read<R: $crate::io::Read>(reader: &mut R) -> Result<Self, $crate::ln::msgs::DecodeError> {
-				$crate::_init_and_read_tlv_fields!(reader, {
+				$crate::_init_and_read_len_prefixed_tlv_fields!(reader, {
 					$(($type, $field, $fieldty)),*
 				});
 				Ok(Self {
@@ -985,7 +1034,7 @@ macro_rules! impl_writeable_tlv_based_enum {
 						// Because read_tlv_fields creates a labeled loop, we cannot call it twice
 						// in the same function body. Instead, we define a closure and call it.
 						let f = || {
-							$crate::_init_and_read_tlv_fields!(reader, {
+							$crate::_init_and_read_len_prefixed_tlv_fields!(reader, {
 								$(($type, $field, $fieldty)),*
 							});
 							Ok($st::$variant_name {
@@ -1039,7 +1088,7 @@ macro_rules! impl_writeable_tlv_based_enum_upgradable {
 						// Because read_tlv_fields creates a labeled loop, we cannot call it twice
 						// in the same function body. Instead, we define a closure and call it.
 						let f = || {
-							$crate::_init_and_read_tlv_fields!(reader, {
+							$crate::_init_and_read_len_prefixed_tlv_fields!(reader, {
 								$(($type, $field, $fieldty)),*
 							});
 							Ok(Some($st::$variant_name {

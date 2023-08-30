@@ -14,7 +14,7 @@
 use crate::chain::ChannelMonitorUpdateStatus;
 use crate::sign::NodeSigner;
 use crate::events::{ClosureReason, Event, HTLCDestination, MessageSendEvent, MessageSendEventsProvider};
-use crate::ln::channelmanager::{ChannelManager, MIN_CLTV_EXPIRY_DELTA, PaymentId, RecipientOnionFields};
+use crate::ln::channelmanager::{MIN_CLTV_EXPIRY_DELTA, PaymentId, RecipientOnionFields};
 use crate::routing::gossip::RoutingFees;
 use crate::routing::router::{PaymentParameters, RouteHint, RouteHintHop};
 use crate::ln::features::ChannelTypeFeatures;
@@ -42,10 +42,10 @@ fn test_priv_forwarding_rejection() {
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 	let mut no_announce_cfg = test_default_channel_config();
 	no_announce_cfg.accept_forwards_to_priv_channels = false;
+	let persister;
+	let new_chain_monitor;
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, Some(no_announce_cfg), None]);
-	let persister: test_utils::TestPersister;
-	let new_chain_monitor: test_utils::TestChainMonitor;
-	let nodes_1_deserialized: ChannelManager<&test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestRouter, &test_utils::TestLogger>;
+	let nodes_1_deserialized;
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
 	let chan_id_1 = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000).2;
@@ -764,7 +764,7 @@ fn test_0conf_close_no_early_chan_update() {
 
 	nodes[0].node.force_close_all_channels_broadcasting_latest_txn();
 	check_added_monitors!(nodes[0], 1);
-	check_closed_event!(&nodes[0], 1, ClosureReason::HolderForceClosed);
+	check_closed_event!(&nodes[0], 1, ClosureReason::HolderForceClosed, [nodes[1].node.get_our_node_id()], 100000);
 	let _ = get_err_msg(&nodes[0], &nodes[1].node.get_our_node_id());
 }
 
@@ -861,12 +861,12 @@ fn test_0conf_channel_reorg() {
 	// now we force-close the channel here.
 	check_closed_event!(&nodes[0], 1, ClosureReason::ProcessingError {
 		err: "Funding transaction was un-confirmed. Locked at 0 confs, now have 0 confs.".to_owned()
-	});
+	}, [nodes[1].node.get_our_node_id()], 100000);
 	check_closed_broadcast!(nodes[0], true);
 	check_added_monitors(&nodes[0], 1);
 	check_closed_event!(&nodes[1], 1, ClosureReason::ProcessingError {
 		err: "Funding transaction was un-confirmed. Locked at 0 confs, now have 0 confs.".to_owned()
-	});
+	}, [nodes[0].node.get_our_node_id()], 100000);
 	check_closed_broadcast!(nodes[1], true);
 	check_added_monitors(&nodes[1], 1);
 }

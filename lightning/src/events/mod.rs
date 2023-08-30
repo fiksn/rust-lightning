@@ -23,7 +23,7 @@ use crate::ln::channelmanager::{InterceptId, PaymentId, RecipientOnionFields};
 use crate::ln::channel::FUNDING_CONF_DEADLINE_BLOCKS;
 use crate::ln::features::ChannelTypeFeatures;
 use crate::ln::msgs;
-use crate::ln::{PaymentPreimage, PaymentHash, PaymentSecret};
+use crate::ln::{ChannelId, PaymentPreimage, PaymentHash, PaymentSecret};
 use crate::routing::gossip::NetworkUpdate;
 use crate::util::errors::APIError;
 use crate::util::ser::{BigSize, FixedLengthReader, Writeable, Writer, MaybeReadable, Readable, RequiredWrapper, UpgradableRequired, WithoutLength};
@@ -78,6 +78,37 @@ impl_writeable_tlv_based_enum!(PaymentPurpose,
 	};
 	(2, SpontaneousPayment)
 );
+
+/// Information about an HTLC that is part of a payment that can be claimed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedHTLC {
+	/// The `channel_id` of the channel over which the HTLC was received.
+	pub channel_id: ChannelId,
+	/// The `user_channel_id` of the channel over which the HTLC was received. This is the value
+	/// passed in to [`ChannelManager::create_channel`] for outbound channels, or to
+	/// [`ChannelManager::accept_inbound_channel`] for inbound channels if
+	/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true. Otherwise
+	/// `user_channel_id` will be randomized for an inbound channel.
+	///
+	/// This field will be zero for a payment that was serialized prior to LDK version 0.0.117. (This
+	/// should only happen in the case that a payment was claimable prior to LDK version 0.0.117, but
+	/// was not actually claimed until after upgrading.)
+	///
+	/// [`ChannelManager::create_channel`]: crate::ln::channelmanager::ChannelManager::create_channel
+	/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
+	/// [`UserConfig::manually_accept_inbound_channels`]: crate::util::config::UserConfig::manually_accept_inbound_channels
+	pub user_channel_id: u128,
+	/// The block height at which this HTLC expires.
+	pub cltv_expiry: u32,
+	/// The amount (in msats) of this part of an MPP.
+	pub value_msat: u64,
+}
+impl_writeable_tlv_based!(ClaimedHTLC, {
+	(0, channel_id, required),
+	(2, user_channel_id, required),
+	(4, cltv_expiry, required),
+	(6, value_msat, required),
+});
 
 /// When the payment path failure took place and extra details about it. [`PathFailure::OnPath`] may
 /// contain a [`NetworkUpdate`] that needs to be applied to the [`NetworkGraph`].
@@ -215,7 +246,7 @@ pub enum HTLCDestination {
 		/// counterparty node information.
 		node_id: Option<PublicKey>,
 		/// The outgoing `channel_id` between us and the next node.
-		channel_id: [u8; 32],
+		channel_id: ChannelId,
 	},
 	/// Scenario where we are unsure of the next node to forward the HTLC to.
 	UnknownNextHop {
@@ -333,7 +364,7 @@ pub enum Event {
 		/// [`ChannelManager::funding_transaction_generated`].
 		///
 		/// [`ChannelManager::funding_transaction_generated`]: crate::ln::channelmanager::ChannelManager::funding_transaction_generated
-		temporary_channel_id: [u8; 32],
+		temporary_channel_id: ChannelId,
 		/// The counterparty's node_id, which you'll need to pass back into
 		/// [`ChannelManager::funding_transaction_generated`].
 		///
@@ -343,11 +374,15 @@ pub enum Event {
 		channel_value_satoshis: u64,
 		/// The script which should be used in the transaction output.
 		output_script: Script,
-		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`], or a
-		/// random value for an inbound channel. This may be zero for objects serialized with LDK
-		/// versions prior to 0.0.113.
+		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
+		/// channels, or to [`ChannelManager::accept_inbound_channel`] for inbound channels if
+		/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true. Otherwise
+		/// `user_channel_id` will be randomized for an inbound channel.  This may be zero for objects
+		/// serialized with LDK versions prior to 0.0.113.
 		///
 		/// [`ChannelManager::create_channel`]: crate::ln::channelmanager::ChannelManager::create_channel
+		/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
+		/// [`UserConfig::manually_accept_inbound_channels`]: crate::util::config::UserConfig::manually_accept_inbound_channels
 		user_channel_id: u128,
 	},
 	/// Indicates that we've been offered a payment and it needs to be claimed via calling
@@ -356,9 +391,19 @@ pub enum Event {
 	/// Note that if the preimage is not known, you should call
 	/// [`ChannelManager::fail_htlc_backwards`] or [`ChannelManager::fail_htlc_backwards_with_reason`]
 	/// to free up resources for this HTLC and avoid network congestion.
-	/// If you fail to call either [`ChannelManager::claim_funds`], [`ChannelManager::fail_htlc_backwards`],
-	/// or [`ChannelManager::fail_htlc_backwards_with_reason`] within the HTLC's timeout, the HTLC will be
-	/// automatically failed.
+	///
+	/// If [`Event::PaymentClaimable::onion_fields`] is `Some`, and includes custom TLVs with even type
+	/// numbers, you should use [`ChannelManager::fail_htlc_backwards_with_reason`] with
+	/// [`FailureCode::InvalidOnionPayload`] if you fail to understand and handle the contents, or
+	/// [`ChannelManager::claim_funds_with_known_custom_tlvs`] upon successful handling.
+	/// If you don't intend to check for custom TLVs, you can simply use
+	/// [`ChannelManager::claim_funds`], which will automatically fail back even custom TLVs.
+	///
+	/// If you fail to call [`ChannelManager::claim_funds`],
+	/// [`ChannelManager::claim_funds_with_known_custom_tlvs`],
+	/// [`ChannelManager::fail_htlc_backwards`], or
+	/// [`ChannelManager::fail_htlc_backwards_with_reason`] within the HTLC's timeout, the HTLC will
+	/// be automatically failed.
 	///
 	/// # Note
 	/// LDK will not stop an inbound payment from being paid multiple times, so multiple
@@ -370,6 +415,8 @@ pub enum Event {
 	/// This event used to be called `PaymentReceived` in LDK versions 0.0.112 and earlier.
 	///
 	/// [`ChannelManager::claim_funds`]: crate::ln::channelmanager::ChannelManager::claim_funds
+	/// [`ChannelManager::claim_funds_with_known_custom_tlvs`]: crate::ln::channelmanager::ChannelManager::claim_funds_with_known_custom_tlvs
+	/// [`FailureCode::InvalidOnionPayload`]: crate::ln::channelmanager::FailureCode::InvalidOnionPayload
 	/// [`ChannelManager::fail_htlc_backwards`]: crate::ln::channelmanager::ChannelManager::fail_htlc_backwards
 	/// [`ChannelManager::fail_htlc_backwards_with_reason`]: crate::ln::channelmanager::ChannelManager::fail_htlc_backwards_with_reason
 	PaymentClaimable {
@@ -411,7 +458,7 @@ pub enum Event {
 		/// payment is to pay an invoice or to send a spontaneous payment.
 		purpose: PaymentPurpose,
 		/// The `channel_id` indicating over which channel we received the payment.
-		via_channel_id: Option<[u8; 32]>,
+		via_channel_id: Option<ChannelId>,
 		/// The `user_channel_id` indicating over which channel we received the payment.
 		via_user_channel_id: Option<u128>,
 		/// The block height at which this payment will be failed back and will no longer be
@@ -454,6 +501,12 @@ pub enum Event {
 		/// The purpose of the claimed payment, i.e. whether the payment was for an invoice or a
 		/// spontaneous payment.
 		purpose: PaymentPurpose,
+		/// The HTLCs that comprise the claimed payment. This will be empty for events serialized prior
+		/// to LDK version 0.0.117.
+		htlcs: Vec<ClaimedHTLC>,
+		/// The sender-intended sum total of all the MPP parts. This will be `None` for events
+		/// serialized prior to LDK version 0.0.117.
+		sender_intended_total_msat: Option<u64>,
 	},
 	/// Indicates an outbound payment we made succeeded (i.e. it made it all the way to its target
 	/// and we got back the payment preimage for it).
@@ -490,6 +543,11 @@ pub enum Event {
 	/// This event is provided once there are no further pending HTLCs for the payment and the
 	/// payment is no longer retryable, due either to the [`Retry`] provided or
 	/// [`ChannelManager::abandon_payment`] having been called for the corresponding payment.
+	///
+	/// In exceedingly rare cases, it is possible that an [`Event::PaymentFailed`] is generated for
+	/// a payment after an [`Event::PaymentSent`] event for this same payment has already been
+	/// received and processed. In this case, the [`Event::PaymentFailed`] event MUST be ignored,
+	/// and the payment MUST be treated as having succeeded.
 	///
 	/// [`Retry`]: crate::ln::channelmanager::Retry
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
@@ -657,16 +715,20 @@ pub enum Event {
 	SpendableOutputs {
 		/// The outputs which you should store as spendable by you.
 		outputs: Vec<SpendableOutputDescriptor>,
+		/// The `channel_id` indicating which channel the spendable outputs belong to.
+		///
+		/// This will always be `Some` for events generated by LDK versions 0.0.117 and above.
+		channel_id: Option<ChannelId>,
 	},
 	/// This event is generated when a payment has been successfully forwarded through us and a
 	/// forwarding fee earned.
 	PaymentForwarded {
 		/// The incoming channel between the previous node and us. This is only `None` for events
 		/// generated or serialized by versions prior to 0.0.107.
-		prev_channel_id: Option<[u8; 32]>,
+		prev_channel_id: Option<ChannelId>,
 		/// The outgoing channel between the next node and us. This is only `None` for events
 		/// generated or serialized by versions prior to 0.0.107.
-		next_channel_id: Option<[u8; 32]>,
+		next_channel_id: Option<ChannelId>,
 		/// The fee, in milli-satoshis, which was earned as a result of the payment.
 		///
 		/// Note that if we force-closed the channel over which we forwarded an HTLC while the HTLC
@@ -697,7 +759,7 @@ pub enum Event {
 	/// [`Event::ChannelReady`] event.
 	ChannelPending {
 		/// The `channel_id` of the channel that is pending confirmation.
-		channel_id: [u8; 32],
+		channel_id: ChannelId,
 		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
 		/// channels, or to [`ChannelManager::accept_inbound_channel`] for inbound channels if
 		/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true. Otherwise
@@ -710,7 +772,7 @@ pub enum Event {
 		/// The `temporary_channel_id` this channel used to be known by during channel establishment.
 		///
 		/// Will be `None` for channels created prior to LDK version 0.0.115.
-		former_temporary_channel_id: Option<[u8; 32]>,
+		former_temporary_channel_id: Option<ChannelId>,
 		/// The `node_id` of the channel counterparty.
 		counterparty_node_id: PublicKey,
 		/// The outpoint of the channel's funding transaction.
@@ -722,7 +784,7 @@ pub enum Event {
 	/// establishment.
 	ChannelReady {
 		/// The `channel_id` of the channel that is ready.
-		channel_id: [u8; 32],
+		channel_id: ChannelId,
 		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
 		/// channels, or to [`ChannelManager::accept_inbound_channel`] for inbound channels if
 		/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true. Otherwise
@@ -739,10 +801,17 @@ pub enum Event {
 	},
 	/// Used to indicate that a previously opened channel with the given `channel_id` is in the
 	/// process of closure.
+	///
+	/// Note that this event is only triggered for accepted channels: if the
+	/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true and the channel is
+	/// rejected, no `ChannelClosed` event will be sent.
+	///
+	/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
+	/// [`UserConfig::manually_accept_inbound_channels`]: crate::util::config::UserConfig::manually_accept_inbound_channels
 	ChannelClosed  {
 		/// The `channel_id` of the channel which has been closed. Note that on-chain transactions
 		/// resolving the channel are likely still awaiting confirmation.
-		channel_id: [u8; 32],
+		channel_id: ChannelId,
 		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
 		/// channels, or to [`ChannelManager::accept_inbound_channel`] for inbound channels if
 		/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true. Otherwise
@@ -755,20 +824,29 @@ pub enum Event {
 		/// [`UserConfig::manually_accept_inbound_channels`]: crate::util::config::UserConfig::manually_accept_inbound_channels
 		user_channel_id: u128,
 		/// The reason the channel was closed.
-		reason: ClosureReason
+		reason: ClosureReason,
+		/// Counterparty in the closed channel.
+		///
+		/// This field will be `None` for objects serialized prior to LDK 0.0.117.
+		counterparty_node_id: Option<PublicKey>,
+		/// Channel capacity of the closing channel (sats).
+		///
+		/// This field will be `None` for objects serialized prior to LDK 0.0.117.
+		channel_capacity_sats: Option<u64>,
 	},
 	/// Used to indicate to the user that they can abandon the funding transaction and recycle the
 	/// inputs for another purpose.
 	DiscardFunding {
 		/// The channel_id of the channel which has been closed.
-		channel_id: [u8; 32],
+		channel_id: ChannelId,
 		/// The full transaction received from the user
 		transaction: Transaction
 	},
 	/// Indicates a request to open a new channel by a peer.
 	///
-	/// To accept the request, call [`ChannelManager::accept_inbound_channel`]. To reject the
-	/// request, call [`ChannelManager::force_close_without_broadcasting_txn`].
+	/// To accept the request, call [`ChannelManager::accept_inbound_channel`]. To reject the request,
+	/// call [`ChannelManager::force_close_without_broadcasting_txn`]. Note that a ['ChannelClosed`]
+	/// event will _not_ be triggered if the channel is rejected.
 	///
 	/// The event is only triggered when a new open channel request is received and the
 	/// [`UserConfig::manually_accept_inbound_channels`] config flag is set to true.
@@ -785,7 +863,7 @@ pub enum Event {
 		///
 		/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
 		/// [`ChannelManager::force_close_without_broadcasting_txn`]: crate::ln::channelmanager::ChannelManager::force_close_without_broadcasting_txn
-		temporary_channel_id: [u8; 32],
+		temporary_channel_id: ChannelId,
 		/// The node_id of the counterparty requesting to open the channel.
 		///
 		/// When responding to the request, the `counterparty_node_id` should be passed
@@ -831,7 +909,7 @@ pub enum Event {
 	/// requirements (i.e. insufficient fees paid, or a CLTV that is too soon).
 	HTLCHandlingFailed {
 		/// The channel over which the HTLC was received.
-		prev_channel_id: [u8; 32],
+		prev_channel_id: ChannelId,
 		/// Destination of the HTLC that failed to be processed.
 		failed_next_destination: HTLCDestination,
 	},
@@ -926,10 +1004,11 @@ impl Writeable for Event {
 				// Note that we now ignore these on the read end as we'll re-generate them in
 				// ChannelManager, we write them here only for backwards compatibility.
 			},
-			&Event::SpendableOutputs { ref outputs } => {
+			&Event::SpendableOutputs { ref outputs, channel_id } => {
 				5u8.write(writer)?;
 				write_tlv_fields!(writer, {
 					(0, WithoutLength(outputs), required),
+					(1, channel_id, option),
 				});
 			},
 			&Event::HTLCIntercepted { requested_next_hop_scid, payment_hash, inbound_amount_msat, expected_outbound_amount_msat, intercept_id } => {
@@ -956,7 +1035,9 @@ impl Writeable for Event {
 					(5, outbound_amount_forwarded_msat, option),
 				});
 			},
-			&Event::ChannelClosed { ref channel_id, ref user_channel_id, ref reason } => {
+			&Event::ChannelClosed { ref channel_id, ref user_channel_id, ref reason,
+				ref counterparty_node_id, ref channel_capacity_sats
+			} => {
 				9u8.write(writer)?;
 				// `user_channel_id` used to be a single u64 value. In order to remain backwards
 				// compatible with versions prior to 0.0.113, the u128 is serialized as two
@@ -968,6 +1049,8 @@ impl Writeable for Event {
 					(1, user_channel_id_low, required),
 					(2, reason, required),
 					(3, user_channel_id_high, required),
+					(5, counterparty_node_id, option),
+					(7, channel_capacity_sats, option),
 				});
 			},
 			&Event::DiscardFunding { ref channel_id, ref transaction } => {
@@ -999,13 +1082,15 @@ impl Writeable for Event {
 				// We never write the OpenChannelRequest events as, upon disconnection, peers
 				// drop any channels which have not yet exchanged funding_signed.
 			},
-			&Event::PaymentClaimed { ref payment_hash, ref amount_msat, ref purpose, ref receiver_node_id } => {
+			&Event::PaymentClaimed { ref payment_hash, ref amount_msat, ref purpose, ref receiver_node_id, ref htlcs, ref sender_intended_total_msat } => {
 				19u8.write(writer)?;
 				write_tlv_fields!(writer, {
 					(0, payment_hash, required),
 					(1, receiver_node_id, option),
 					(2, purpose, required),
 					(4, amount_msat, required),
+					(5, *htlcs, optional_vec),
+					(7, sender_intended_total_msat, option),
 				});
 			},
 			&Event::ProbeSuccessful { ref payment_id, ref payment_hash, ref path } => {
@@ -1194,10 +1279,12 @@ impl MaybeReadable for Event {
 			5u8 => {
 				let f = || {
 					let mut outputs = WithoutLength(Vec::new());
+					let mut channel_id: Option<ChannelId> = None;
 					read_tlv_fields!(reader, {
 						(0, outputs, required),
+						(1, channel_id, option),
 					});
-					Ok(Some(Event::SpendableOutputs { outputs: outputs.0 }))
+					Ok(Some(Event::SpendableOutputs { outputs: outputs.0, channel_id }))
 				};
 				f()
 			},
@@ -1248,15 +1335,19 @@ impl MaybeReadable for Event {
 			},
 			9u8 => {
 				let f = || {
-					let mut channel_id = [0; 32];
+					let mut channel_id = ChannelId::new_zero();
 					let mut reason = UpgradableRequired(None);
 					let mut user_channel_id_low_opt: Option<u64> = None;
 					let mut user_channel_id_high_opt: Option<u64> = None;
+					let mut counterparty_node_id = None;
+					let mut channel_capacity_sats = None;
 					read_tlv_fields!(reader, {
 						(0, channel_id, required),
 						(1, user_channel_id_low_opt, option),
 						(2, reason, upgradable_required),
 						(3, user_channel_id_high_opt, option),
+						(5, counterparty_node_id, option),
+						(7, channel_capacity_sats, option),
 					});
 
 					// `user_channel_id` used to be a single u64 value. In order to remain
@@ -1265,13 +1356,14 @@ impl MaybeReadable for Event {
 					let user_channel_id = (user_channel_id_low_opt.unwrap_or(0) as u128) +
 						((user_channel_id_high_opt.unwrap_or(0) as u128) << 64);
 
-					Ok(Some(Event::ChannelClosed { channel_id, user_channel_id, reason: _init_tlv_based_struct_field!(reason, upgradable_required) }))
+					Ok(Some(Event::ChannelClosed { channel_id, user_channel_id, reason: _init_tlv_based_struct_field!(reason, upgradable_required),
+						counterparty_node_id, channel_capacity_sats }))
 				};
 				f()
 			},
 			11u8 => {
 				let f = || {
-					let mut channel_id = [0; 32];
+					let mut channel_id = ChannelId::new_zero();
 					let mut transaction = Transaction{ version: 2, lock_time: PackedLockTime::ZERO, input: Vec::new(), output: Vec::new() };
 					read_tlv_fields!(reader, {
 						(0, channel_id, required),
@@ -1283,7 +1375,7 @@ impl MaybeReadable for Event {
 			},
 			13u8 => {
 				let f = || {
-					_init_and_read_tlv_fields!(reader, {
+					_init_and_read_len_prefixed_tlv_fields!(reader, {
 						(0, payment_id, required),
 						(2, payment_hash, option),
 						(4, path, required_vec),
@@ -1325,24 +1417,30 @@ impl MaybeReadable for Event {
 					let mut purpose = UpgradableRequired(None);
 					let mut amount_msat = 0;
 					let mut receiver_node_id = None;
+					let mut htlcs: Option<Vec<ClaimedHTLC>> = Some(vec![]);
+					let mut sender_intended_total_msat: Option<u64> = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, receiver_node_id, option),
 						(2, purpose, upgradable_required),
 						(4, amount_msat, required),
+						(5, htlcs, optional_vec),
+						(7, sender_intended_total_msat, option),
 					});
 					Ok(Some(Event::PaymentClaimed {
 						receiver_node_id,
 						payment_hash,
 						purpose: _init_tlv_based_struct_field!(purpose, upgradable_required),
 						amount_msat,
+						htlcs: htlcs.unwrap_or(vec![]),
+						sender_intended_total_msat,
 					}))
 				};
 				f()
 			},
 			21u8 => {
 				let f = || {
-					_init_and_read_tlv_fields!(reader, {
+					_init_and_read_len_prefixed_tlv_fields!(reader, {
 						(0, payment_id, required),
 						(2, payment_hash, required),
 						(4, path, required_vec),
@@ -1358,7 +1456,7 @@ impl MaybeReadable for Event {
 			},
 			23u8 => {
 				let f = || {
-					_init_and_read_tlv_fields!(reader, {
+					_init_and_read_len_prefixed_tlv_fields!(reader, {
 						(0, payment_id, required),
 						(2, payment_hash, required),
 						(4, path, required_vec),
@@ -1376,7 +1474,7 @@ impl MaybeReadable for Event {
 			},
 			25u8 => {
 				let f = || {
-					let mut prev_channel_id = [0; 32];
+					let mut prev_channel_id = ChannelId::new_zero();
 					let mut failed_next_destination_opt = UpgradableRequired(None);
 					read_tlv_fields!(reader, {
 						(0, prev_channel_id, required),
@@ -1392,7 +1490,7 @@ impl MaybeReadable for Event {
 			27u8 => Ok(None),
 			29u8 => {
 				let f = || {
-					let mut channel_id = [0; 32];
+					let mut channel_id = ChannelId::new_zero();
 					let mut user_channel_id: u128 = 0;
 					let mut counterparty_node_id = RequiredWrapper(None);
 					let mut channel_type = RequiredWrapper(None);
@@ -1414,7 +1512,7 @@ impl MaybeReadable for Event {
 			},
 			31u8 => {
 				let f = || {
-					let mut channel_id = [0; 32];
+					let mut channel_id = ChannelId::new_zero();
 					let mut user_channel_id: u128 = 0;
 					let mut former_temporary_channel_id = None;
 					let mut counterparty_node_id = RequiredWrapper(None);
@@ -1460,6 +1558,7 @@ impl MaybeReadable for Event {
 /// broadcast to most peers).
 /// These events are handled by PeerManager::process_events if you are using a PeerManager.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum MessageSendEvent {
 	/// Used to indicate that we've accepted a channel open and should send the accept_channel
 	/// message provided to the given peer.

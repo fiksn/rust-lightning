@@ -77,6 +77,7 @@ use core::time::Duration;
 use crate::sign::EntropySource;
 use crate::io;
 use crate::blinded_path::BlindedPath;
+use crate::ln::channelmanager::PaymentId;
 use crate::ln::features::OfferFeatures;
 use crate::ln::inbound_payment::{ExpandedKey, IV_LEN, Nonce};
 use crate::ln::msgs::MAX_VALUE_MSAT;
@@ -169,7 +170,7 @@ impl<'a, T: secp256k1::Signing> OfferBuilder<'a, DerivedMetadata, T> {
 		secp_ctx: &'a Secp256k1<T>
 	) -> Self where ES::Target: EntropySource {
 		let nonce = Nonce::from_entropy_source(entropy_source);
-		let derivation_material = MetadataMaterial::new(nonce, expanded_key, IV_BYTES);
+		let derivation_material = MetadataMaterial::new(nonce, expanded_key, IV_BYTES, None);
 		let metadata = Metadata::DerivedSigningPubkey(derivation_material);
 		OfferBuilder {
 			offer: OfferContents {
@@ -283,7 +284,7 @@ impl<'a, M: MetadataStrategy, T: secp256k1::Signing> OfferBuilder<'a, M, T> {
 				let mut tlv_stream = self.offer.as_tlv_stream();
 				debug_assert_eq!(tlv_stream.metadata, None);
 				tlv_stream.metadata = None;
-				if metadata.derives_keys() {
+				if metadata.derives_recipient_keys() {
 					tlv_stream.node_id = None;
 				}
 
@@ -358,16 +359,72 @@ pub(super) struct OfferContents {
 	signing_pubkey: PublicKey,
 }
 
-impl Offer {
+macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 	// TODO: Return a slice once ChainHash has constants.
 	// - https://github.com/rust-bitcoin/rust-bitcoin/pull/1283
 	// - https://github.com/rust-bitcoin/rust-bitcoin/pull/1286
 	/// The chains that may be used when paying a requested invoice (e.g., bitcoin mainnet).
 	/// Payments must be denominated in units of the minimal lightning-payable unit (e.g., msats)
 	/// for the selected chain.
-	pub fn chains(&self) -> Vec<ChainHash> {
-		self.contents.chains()
+	pub fn chains(&$self) -> Vec<$crate::bitcoin::blockdata::constants::ChainHash> {
+		$contents.chains()
 	}
+
+	// TODO: Link to corresponding method in `InvoiceRequest`.
+	/// Opaque bytes set by the originator. Useful for authentication and validating fields since it
+	/// is reflected in `invoice_request` messages along with all the other fields from the `offer`.
+	pub fn metadata(&$self) -> Option<&Vec<u8>> {
+		$contents.metadata()
+	}
+
+	/// The minimum amount required for a successful payment of a single item.
+	pub fn amount(&$self) -> Option<&$crate::offers::offer::Amount> {
+		$contents.amount()
+	}
+
+	/// A complete description of the purpose of the payment. Intended to be displayed to the user
+	/// but with the caveat that it has not been verified in any way.
+	pub fn description(&$self) -> $crate::util::string::PrintableString {
+		$contents.description()
+	}
+
+	/// Features pertaining to the offer.
+	pub fn offer_features(&$self) -> &$crate::ln::features::OfferFeatures {
+		&$contents.features()
+	}
+
+	/// Duration since the Unix epoch when an invoice should no longer be requested.
+	///
+	/// If `None`, the offer does not expire.
+	pub fn absolute_expiry(&$self) -> Option<core::time::Duration> {
+		$contents.absolute_expiry()
+	}
+
+	/// The issuer of the offer, possibly beginning with `user@domain` or `domain`. Intended to be
+	/// displayed to the user but with the caveat that it has not been verified in any way.
+	pub fn issuer(&$self) -> Option<$crate::util::string::PrintableString> {
+		$contents.issuer()
+	}
+
+	/// Paths to the recipient originating from publicly reachable nodes. Blinded paths provide
+	/// recipient privacy by obfuscating its node id.
+	pub fn paths(&$self) -> &[$crate::blinded_path::BlindedPath] {
+		$contents.paths()
+	}
+
+	/// The quantity of items supported.
+	pub fn supported_quantity(&$self) -> $crate::offers::offer::Quantity {
+		$contents.supported_quantity()
+	}
+
+	/// The public key used by the recipient to sign invoices.
+	pub fn signing_pubkey(&$self) -> $crate::bitcoin::secp256k1::PublicKey {
+		$contents.signing_pubkey()
+	}
+} }
+
+impl Offer {
+	offer_accessors!(self, self.contents);
 
 	pub(super) fn implied_chain(&self) -> ChainHash {
 		self.contents.implied_chain()
@@ -378,57 +435,10 @@ impl Offer {
 		self.contents.supports_chain(chain)
 	}
 
-	// TODO: Link to corresponding method in `InvoiceRequest`.
-	/// Opaque bytes set by the originator. Useful for authentication and validating fields since it
-	/// is reflected in `invoice_request` messages along with all the other fields from the `offer`.
-	pub fn metadata(&self) -> Option<&Vec<u8>> {
-		self.contents.metadata()
-	}
-
-	/// The minimum amount required for a successful payment of a single item.
-	pub fn amount(&self) -> Option<&Amount> {
-		self.contents.amount()
-	}
-
-	/// A complete description of the purpose of the payment. Intended to be displayed to the user
-	/// but with the caveat that it has not been verified in any way.
-	pub fn description(&self) -> PrintableString {
-		self.contents.description()
-	}
-
-	/// Features pertaining to the offer.
-	pub fn features(&self) -> &OfferFeatures {
-		&self.contents.features
-	}
-
-	/// Duration since the Unix epoch when an invoice should no longer be requested.
-	///
-	/// If `None`, the offer does not expire.
-	pub fn absolute_expiry(&self) -> Option<Duration> {
-		self.contents.absolute_expiry
-	}
-
 	/// Whether the offer has expired.
 	#[cfg(feature = "std")]
 	pub fn is_expired(&self) -> bool {
 		self.contents.is_expired()
-	}
-
-	/// The issuer of the offer, possibly beginning with `user@domain` or `domain`. Intended to be
-	/// displayed to the user but with the caveat that it has not been verified in any way.
-	pub fn issuer(&self) -> Option<PrintableString> {
-		self.contents.issuer.as_ref().map(|issuer| PrintableString(issuer.as_str()))
-	}
-
-	/// Paths to the recipient originating from publicly reachable nodes. Blinded paths provide
-	/// recipient privacy by obfuscating its node id.
-	pub fn paths(&self) -> &[BlindedPath] {
-		self.contents.paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
-	}
-
-	/// The quantity of items supported.
-	pub fn supported_quantity(&self) -> Quantity {
-		self.contents.supported_quantity()
 	}
 
 	/// Returns whether the given quantity is valid for the offer.
@@ -443,37 +453,37 @@ impl Offer {
 		self.contents.expects_quantity()
 	}
 
-	/// The public key used by the recipient to sign invoices.
-	pub fn signing_pubkey(&self) -> PublicKey {
-		self.contents.signing_pubkey()
-	}
-
 	/// Similar to [`Offer::request_invoice`] except it:
 	/// - derives the [`InvoiceRequest::payer_id`] such that a different key can be used for each
-	///   request, and
-	/// - sets the [`InvoiceRequest::metadata`] when [`InvoiceRequestBuilder::build`] is called such
-	///   that it can be used by [`Bolt12Invoice::verify`] to determine if the invoice was requested
-	///   using a base [`ExpandedKey`] from which the payer id was derived.
+	///   request,
+	/// - sets [`InvoiceRequest::payer_metadata`] when [`InvoiceRequestBuilder::build`] is called
+	///   such that it can be used by [`Bolt12Invoice::verify`] to determine if the invoice was
+	///   requested using a base [`ExpandedKey`] from which the payer id was derived, and
+	/// - includes the [`PaymentId`] encrypted in [`InvoiceRequest::payer_metadata`] so that it can
+	///   be used when sending the payment for the requested invoice.
 	///
 	/// Useful to protect the sender's privacy.
 	///
 	/// This is not exported to bindings users as builder patterns don't map outside of move semantics.
 	///
 	/// [`InvoiceRequest::payer_id`]: crate::offers::invoice_request::InvoiceRequest::payer_id
-	/// [`InvoiceRequest::metadata`]: crate::offers::invoice_request::InvoiceRequest::metadata
+	/// [`InvoiceRequest::payer_metadata`]: crate::offers::invoice_request::InvoiceRequest::payer_metadata
 	/// [`Bolt12Invoice::verify`]: crate::offers::invoice::Bolt12Invoice::verify
 	/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
 	pub fn request_invoice_deriving_payer_id<'a, 'b, ES: Deref, T: secp256k1::Signing>(
-		&'a self, expanded_key: &ExpandedKey, entropy_source: ES, secp_ctx: &'b Secp256k1<T>
+		&'a self, expanded_key: &ExpandedKey, entropy_source: ES, secp_ctx: &'b Secp256k1<T>,
+		payment_id: PaymentId
 	) -> Result<InvoiceRequestBuilder<'a, 'b, DerivedPayerId, T>, Bolt12SemanticError>
 	where
 		ES::Target: EntropySource,
 	{
-		if self.features().requires_unknown_bits() {
+		if self.offer_features().requires_unknown_bits() {
 			return Err(Bolt12SemanticError::UnknownRequiredFeatures);
 		}
 
-		Ok(InvoiceRequestBuilder::deriving_payer_id(self, expanded_key, entropy_source, secp_ctx))
+		Ok(InvoiceRequestBuilder::deriving_payer_id(
+			self, expanded_key, entropy_source, secp_ctx, payment_id
+		))
 	}
 
 	/// Similar to [`Offer::request_invoice_deriving_payer_id`] except uses `payer_id` for the
@@ -485,16 +495,19 @@ impl Offer {
 	///
 	/// [`InvoiceRequest::payer_id`]: crate::offers::invoice_request::InvoiceRequest::payer_id
 	pub fn request_invoice_deriving_metadata<ES: Deref>(
-		&self, payer_id: PublicKey, expanded_key: &ExpandedKey, entropy_source: ES
+		&self, payer_id: PublicKey, expanded_key: &ExpandedKey, entropy_source: ES,
+		payment_id: PaymentId
 	) -> Result<InvoiceRequestBuilder<ExplicitPayerId, secp256k1::SignOnly>, Bolt12SemanticError>
 	where
 		ES::Target: EntropySource,
 	{
-		if self.features().requires_unknown_bits() {
+		if self.offer_features().requires_unknown_bits() {
 			return Err(Bolt12SemanticError::UnknownRequiredFeatures);
 		}
 
-		Ok(InvoiceRequestBuilder::deriving_metadata(self, payer_id, expanded_key, entropy_source))
+		Ok(InvoiceRequestBuilder::deriving_metadata(
+			self, payer_id, expanded_key, entropy_source, payment_id
+		))
 	}
 
 	/// Creates an [`InvoiceRequestBuilder`] for the offer with the given `metadata` and `payer_id`,
@@ -515,7 +528,7 @@ impl Offer {
 	pub fn request_invoice(
 		&self, metadata: Vec<u8>, payer_id: PublicKey
 	) -> Result<InvoiceRequestBuilder<ExplicitPayerId, secp256k1::SignOnly>, Bolt12SemanticError> {
-		if self.features().requires_unknown_bits() {
+		if self.offer_features().requires_unknown_bits() {
 			return Err(Bolt12SemanticError::UnknownRequiredFeatures);
 		}
 
@@ -551,8 +564,20 @@ impl OfferContents {
 		self.metadata.as_ref().and_then(|metadata| metadata.as_bytes())
 	}
 
+	pub fn amount(&self) -> Option<&Amount> {
+		self.amount.as_ref()
+	}
+
 	pub fn description(&self) -> PrintableString {
 		PrintableString(&self.description)
+	}
+
+	pub fn features(&self) -> &OfferFeatures {
+		&self.features
+	}
+
+	pub fn absolute_expiry(&self) -> Option<Duration> {
+		self.absolute_expiry
 	}
 
 	#[cfg(feature = "std")]
@@ -566,8 +591,12 @@ impl OfferContents {
 		}
 	}
 
-	pub fn amount(&self) -> Option<&Amount> {
-		self.amount.as_ref()
+	pub fn issuer(&self) -> Option<PrintableString> {
+		self.issuer.as_ref().map(|issuer| PrintableString(issuer.as_str()))
+	}
+
+	pub fn paths(&self) -> &[BlindedPath] {
+		self.paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
 	}
 
 	pub(super) fn check_amount_msats_for_quantity(
@@ -641,11 +670,13 @@ impl OfferContents {
 				let tlv_stream = TlvStream::new(bytes).range(OFFER_TYPES).filter(|record| {
 					match record.r#type {
 						OFFER_METADATA_TYPE => false,
-						OFFER_NODE_ID_TYPE => !self.metadata.as_ref().unwrap().derives_keys(),
+						OFFER_NODE_ID_TYPE => {
+							!self.metadata.as_ref().unwrap().derives_recipient_keys()
+						},
 						_ => true,
 					}
 				});
-				signer::verify_metadata(
+				signer::verify_recipient_metadata(
 					metadata, key, IV_BYTES, self.signing_pubkey(), tlv_stream, secp_ctx
 				)
 			},
@@ -874,7 +905,7 @@ mod tests {
 		assert_eq!(offer.metadata(), None);
 		assert_eq!(offer.amount(), None);
 		assert_eq!(offer.description(), PrintableString("foo"));
-		assert_eq!(offer.features(), &OfferFeatures::empty());
+		assert_eq!(offer.offer_features(), &OfferFeatures::empty());
 		assert_eq!(offer.absolute_expiry(), None);
 		#[cfg(feature = "std")]
 		assert!(!offer.is_expired());
@@ -1115,7 +1146,7 @@ mod tests {
 			.features_unchecked(OfferFeatures::unknown())
 			.build()
 			.unwrap();
-		assert_eq!(offer.features(), &OfferFeatures::unknown());
+		assert_eq!(offer.offer_features(), &OfferFeatures::unknown());
 		assert_eq!(offer.as_tlv_stream().features, Some(&OfferFeatures::unknown()));
 
 		let offer = OfferBuilder::new("foo".into(), pubkey(42))
@@ -1123,7 +1154,7 @@ mod tests {
 			.features_unchecked(OfferFeatures::empty())
 			.build()
 			.unwrap();
-		assert_eq!(offer.features(), &OfferFeatures::empty());
+		assert_eq!(offer.offer_features(), &OfferFeatures::empty());
 		assert_eq!(offer.as_tlv_stream().features, None);
 	}
 

@@ -22,6 +22,7 @@ use bitcoin::secp256k1::{self, Secp256k1, SecretKey, PublicKey};
 
 use crate::sign::{KeysManager, NodeSigner, Recipient};
 use crate::events::{MessageSendEvent, MessageSendEventsProvider, OnionMessageProvider};
+use crate::ln::ChannelId;
 use crate::ln::features::{InitFeatures, NodeFeatures};
 use crate::ln::msgs;
 use crate::ln::msgs::{ChannelMessageHandler, LightningError, NetAddress, OnionMessageHandler, RoutingMessageHandler};
@@ -188,7 +189,7 @@ impl ErroringMessageHandler {
 	pub fn new() -> Self {
 		Self { message_queue: Mutex::new(Vec::new()) }
 	}
-	fn push_error(&self, node_id: &PublicKey, channel_id: [u8; 32]) {
+	fn push_error(&self, node_id: &PublicKey, channel_id: ChannelId) {
 		self.message_queue.lock().unwrap().push(MessageSendEvent::HandleError {
 			action: msgs::ErrorAction::SendErrorMessage {
 				msg: msgs::ErrorMessage { channel_id, data: "We do not support channel messages, sorry.".to_owned() },
@@ -1422,13 +1423,13 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 												}
 												(msgs::DecodeError::UnsupportedCompression, _) => {
 													log_gossip!(self.logger, "We don't support zlib-compressed message fields, sending a warning and ignoring message");
-													self.enqueue_message(peer, &msgs::WarningMessage { channel_id: [0; 32], data: "Unsupported message compression: zlib".to_owned() });
+													self.enqueue_message(peer, &msgs::WarningMessage { channel_id: ChannelId::new_zero(), data: "Unsupported message compression: zlib".to_owned() });
 													continue;
 												}
 												(_, Some(ty)) if is_gossip_msg(ty) => {
 													log_gossip!(self.logger, "Got an invalid value while deserializing a gossip message");
 													self.enqueue_message(peer, &msgs::WarningMessage {
-														channel_id: [0; 32],
+														channel_id: ChannelId::new_zero(),
 														data: format!("Unreadable/bogus gossip message of type {}", ty),
 													});
 													continue;
@@ -1594,7 +1595,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 			wire::Message::Error(msg) => {
 				log_debug!(self.logger, "Got Err message from {}: {}", log_pubkey!(their_node_id), PrintableString(&msg.data));
 				self.message_handler.chan_handler.handle_error(&their_node_id, &msg);
-				if msg.channel_id == [0; 32] {
+				if msg.channel_id.is_zero() {
 					return Err(PeerHandleError { }.into());
 				}
 			},
@@ -1915,31 +1916,31 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 						MessageSendEvent::SendAcceptChannel { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendAcceptChannel event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.temporary_channel_id));
+									&msg.temporary_channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendAcceptChannelV2 { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendAcceptChannelV2 event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.temporary_channel_id));
+									&msg.temporary_channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendOpenChannel { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendOpenChannel event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.temporary_channel_id));
+									&msg.temporary_channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendOpenChannelV2 { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendOpenChannelV2 event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.temporary_channel_id));
+									&msg.temporary_channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendFundingCreated { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendFundingCreated event in peer_handler for node {} for channel {} (which becomes {})",
 									log_pubkey!(node_id),
-									log_bytes!(msg.temporary_channel_id),
+									&msg.temporary_channel_id,
 									log_funding_channel_id!(msg.funding_txid, msg.funding_output_index));
 							// TODO: If the peer is gone we should generate a DiscardFunding event
 							// indicating to the wallet that they should just throw away this funding transaction
@@ -1948,73 +1949,73 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 						MessageSendEvent::SendFundingSigned { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendFundingSigned event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendChannelReady { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendChannelReady event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxAddInput { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxAddInput event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxAddOutput { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxAddOutput event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxRemoveInput { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxRemoveInput event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxRemoveOutput { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxRemoveOutput event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxComplete { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxComplete event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxSignatures { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxSignatures event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxInitRbf { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxInitRbf event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxAckRbf { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxAckRbf event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendTxAbort { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendTxAbort event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendAnnouncementSignatures { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendAnnouncementSignatures event in peer_handler for node {} for channel {})",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::UpdateHTLCs { ref node_id, updates: msgs::CommitmentUpdate { ref update_add_htlcs, ref update_fulfill_htlcs, ref update_fail_htlcs, ref update_fail_malformed_htlcs, ref update_fee, ref commitment_signed } } => {
@@ -2023,7 +2024,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 									update_add_htlcs.len(),
 									update_fulfill_htlcs.len(),
 									update_fail_htlcs.len(),
-									log_bytes!(commitment_signed.channel_id));
+									&commitment_signed.channel_id);
 							let mut peer = get_peer_for_forwarding!(node_id);
 							for msg in update_add_htlcs {
 								self.enqueue_message(&mut *peer, msg);
@@ -2045,25 +2046,25 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 						MessageSendEvent::SendRevokeAndACK { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendRevokeAndACK event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendClosingSigned { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendClosingSigned event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendShutdown { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling Shutdown event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendChannelReestablish { ref node_id, ref msg } => {
 							log_debug!(self.logger, "Handling SendChannelReestablish event in peer_handler for node {} for channel {}",
 									log_pubkey!(node_id),
-									log_bytes!(msg.channel_id));
+									&msg.channel_id);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id), msg);
 						},
 						MessageSendEvent::SendChannelAnnouncement { ref node_id, ref msg, ref update_msg } => {
@@ -2089,7 +2090,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 							}
 						},
 						MessageSendEvent::BroadcastChannelUpdate { msg } => {
-							log_debug!(self.logger, "Handling BroadcastChannelUpdate event in peer_handler for short channel id {}", msg.contents.short_channel_id);
+							log_debug!(self.logger, "Handling BroadcastChannelUpdate event in peer_handler for contents {:?}", msg.contents);
 							match self.message_handler.route_handler.handle_channel_update(&msg) {
 								Ok(_) | Err(LightningError { action: msgs::ErrorAction::IgnoreDuplicateGossip, .. }) =>
 									self.forward_broadcast_msg(peers, &wire::Message::ChannelUpdate(msg), None),
@@ -2516,6 +2517,7 @@ mod tests {
 	use crate::sign::{NodeSigner, Recipient};
 	use crate::events;
 	use crate::io;
+	use crate::ln::ChannelId;
 	use crate::ln::features::{InitFeatures, NodeFeatures};
 	use crate::ln::peer_channel_encryptor::PeerChannelEncryptor;
 	use crate::ln::peer_handler::{CustomMessageHandler, PeerManager, MessageHandler, SocketDescriptor, IgnoringMessageHandler, filter_addresses};
@@ -2755,7 +2757,7 @@ mod tests {
 							.push(crate::events::MessageSendEvent::SendShutdown {
 								node_id: peers[1].node_signer.get_node_id(Recipient::Node).unwrap(),
 								msg: msgs::Shutdown {
-									channel_id: [0; 32],
+									channel_id: ChannelId::new_zero(),
 									scriptpubkey: bitcoin::Script::new(),
 								},
 							});
@@ -2763,7 +2765,7 @@ mod tests {
 							.push(crate::events::MessageSendEvent::SendShutdown {
 								node_id: peers[0].node_signer.get_node_id(Recipient::Node).unwrap(),
 								msg: msgs::Shutdown {
-									channel_id: [0; 32],
+									channel_id: ChannelId::new_zero(),
 									scriptpubkey: bitcoin::Script::new(),
 								},
 							});
@@ -2892,7 +2894,7 @@ mod tests {
 
 		let their_id = peers[1].node_signer.get_node_id(Recipient::Node).unwrap();
 
-		let msg = msgs::Shutdown { channel_id: [42; 32], scriptpubkey: bitcoin::Script::new() };
+		let msg = msgs::Shutdown { channel_id: ChannelId::from_bytes([42; 32]), scriptpubkey: bitcoin::Script::new() };
 		a_chan_handler.pending_events.lock().unwrap().push(events::MessageSendEvent::SendShutdown {
 			node_id: their_id, msg: msg.clone()
 		});

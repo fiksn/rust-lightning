@@ -23,6 +23,7 @@ use bitcoin::network::constants::Network;
 use bitcoin::blockdata::constants::genesis_block;
 
 use crate::events::{MessageSendEvent, MessageSendEventsProvider};
+use crate::ln::ChannelId;
 use crate::ln::features::{ChannelFeatures, NodeFeatures, InitFeatures};
 use crate::ln::msgs::{DecodeError, ErrorAction, Init, LightningError, RoutingMessageHandler, NetAddress, MAX_VALUE_MSAT};
 use crate::ln::msgs::{ChannelAnnouncement, ChannelUpdate, NodeAnnouncement, GossipTimestampFilter};
@@ -88,12 +89,12 @@ impl NodeId {
 
 impl fmt::Debug for NodeId {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "NodeId({})", log_bytes!(self.0))
+		write!(f, "NodeId({})", crate::util::logger::DebugBytes(&self.0))
 	}
 }
 impl fmt::Display for NodeId {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "{}", log_bytes!(self.0))
+		crate::util::logger::DebugBytes(&self.0).fmt(f)
 	}
 }
 
@@ -254,7 +255,7 @@ pub struct P2PGossipSync<G: Deref<Target=NetworkGraph<L>>, U: Deref, L: Deref>
 where U::Target: UtxoLookup, L::Target: Logger
 {
 	network_graph: G,
-	utxo_lookup: Option<U>,
+	utxo_lookup: RwLock<Option<U>>,
 	#[cfg(feature = "std")]
 	full_syncs_requested: AtomicUsize,
 	pending_events: Mutex<Vec<MessageSendEvent>>,
@@ -273,7 +274,7 @@ where U::Target: UtxoLookup, L::Target: Logger
 			network_graph,
 			#[cfg(feature = "std")]
 			full_syncs_requested: AtomicUsize::new(0),
-			utxo_lookup,
+			utxo_lookup: RwLock::new(utxo_lookup),
 			pending_events: Mutex::new(vec![]),
 			logger,
 		}
@@ -282,8 +283,8 @@ where U::Target: UtxoLookup, L::Target: Logger
 	/// Adds a provider used to check new announcements. Does not affect
 	/// existing announcements unless they are updated.
 	/// Add, update or remove the provider would replace the current one.
-	pub fn add_utxo_lookup(&mut self, utxo_lookup: Option<U>) {
-		self.utxo_lookup = utxo_lookup;
+	pub fn add_utxo_lookup(&self, utxo_lookup: Option<U>) {
+		*self.utxo_lookup.write().unwrap() = utxo_lookup;
 	}
 
 	/// Gets a reference to the underlying [`NetworkGraph`] which was provided in
@@ -382,7 +383,7 @@ macro_rules! secp_verify_sig {
 					err: format!("Invalid signature on {} message", $msg_type),
 					action: ErrorAction::SendWarningMessage {
 						msg: msgs::WarningMessage {
-							channel_id: [0; 32],
+							channel_id: ChannelId::new_zero(),
 							data: format!("Invalid signature on {} message", $msg_type),
 						},
 						log_level: Level::Trace,
@@ -400,7 +401,7 @@ macro_rules! get_pubkey_from_node_id {
 				err: format!("Invalid public key on {} message", $msg_type),
 				action: ErrorAction::SendWarningMessage {
 					msg: msgs::WarningMessage {
-						channel_id: [0; 32],
+						channel_id: ChannelId::new_zero(),
 						data: format!("Invalid public key on {} message", $msg_type),
 					},
 					log_level: Level::Trace
@@ -443,7 +444,7 @@ where U::Target: UtxoLookup, L::Target: Logger
 	}
 
 	fn handle_channel_announcement(&self, msg: &msgs::ChannelAnnouncement) -> Result<bool, LightningError> {
-		self.network_graph.update_channel_from_announcement(msg, &self.utxo_lookup)?;
+		self.network_graph.update_channel_from_announcement(msg, &*self.utxo_lookup.read().unwrap())?;
 		Ok(msg.contents.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY)
 	}
 
@@ -899,7 +900,7 @@ impl ChannelInfo {
 impl fmt::Display for ChannelInfo {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		write!(f, "features: {}, node_one: {}, one_to_two: {:?}, node_two: {}, two_to_one: {:?}",
-		   log_bytes!(self.features.encode()), log_bytes!(self.node_one.as_slice()), self.one_to_two, log_bytes!(self.node_two.as_slice()), self.two_to_one)?;
+		   log_bytes!(self.features.encode()), &self.node_one, self.one_to_two, &self.node_two, self.two_to_one)?;
 		Ok(())
 	}
 }
@@ -1151,7 +1152,7 @@ impl Writeable for NodeAnnouncementInfo {
 
 impl Readable for NodeAnnouncementInfo {
 	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
-		_init_and_read_tlv_fields!(reader, {
+		_init_and_read_len_prefixed_tlv_fields!(reader, {
 			(0, features, required),
 			(2, last_update, required),
 			(4, rgb, required),
@@ -1259,7 +1260,7 @@ impl Readable for NodeInfo {
 		// with zero inbound fees, causing that heuristic to provide little gain. Worse, because it
 		// requires additional complexity and lookups during routing, it ends up being a
 		// performance loss. Thus, we simply ignore the old field here and no longer track it.
-		_init_and_read_tlv_fields!(reader, {
+		_init_and_read_len_prefixed_tlv_fields!(reader, {
 			(0, _lowest_inbound_channel_fees, option),
 			(2, announcement_info_wrap, upgradable_option),
 			(4, channels, required_vec),
@@ -1350,7 +1351,7 @@ impl<L: Deref> fmt::Display for NetworkGraph<L> where L::Target: Logger {
 		}
 		writeln!(f, "[Nodes]")?;
 		for (&node_id, val) in self.nodes.read().unwrap().unordered_iter() {
-			writeln!(f, " {}: {}", log_bytes!(node_id.as_slice()), val)?;
+			writeln!(f, " {}: {}", &node_id, val)?;
 		}
 		Ok(())
 	}
@@ -1552,6 +1553,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 
 		let node_id_a = channel_info.node_one.clone();
 		let node_id_b = channel_info.node_two.clone();
+
+		log_gossip!(self.logger, "Adding channel {} between nodes {} and {}", short_channel_id, node_id_a, node_id_b);
 
 		match channels.entry(short_channel_id) {
 			IndexedMapEntry::Occupied(mut entry) => {
@@ -1788,16 +1791,23 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		let mut scids_to_remove = Vec::new();
 		for (scid, info) in channels.unordered_iter_mut() {
 			if info.one_to_two.is_some() && info.one_to_two.as_ref().unwrap().last_update < min_time_unix {
+				log_gossip!(self.logger, "Removing directional update one_to_two (0) for channel {} due to its timestamp {} being below {}",
+					scid, info.one_to_two.as_ref().unwrap().last_update, min_time_unix);
 				info.one_to_two = None;
 			}
 			if info.two_to_one.is_some() && info.two_to_one.as_ref().unwrap().last_update < min_time_unix {
+				log_gossip!(self.logger, "Removing directional update two_to_one (1) for channel {} due to its timestamp {} being below {}",
+					scid, info.two_to_one.as_ref().unwrap().last_update, min_time_unix);
 				info.two_to_one = None;
 			}
 			if info.one_to_two.is_none() || info.two_to_one.is_none() {
 				// We check the announcement_received_time here to ensure we don't drop
 				// announcements that we just received and are just waiting for our peer to send a
 				// channel_update for.
-				if info.announcement_received_time < min_time_unix as u64 {
+				let announcement_received_timestamp = info.announcement_received_time;
+				if announcement_received_timestamp < min_time_unix as u64 {
+					log_gossip!(self.logger, "Removing channel {} because both directional updates are missing and its announcement timestamp {} being below {}",
+						scid, announcement_received_timestamp, min_time_unix);
 					scids_to_remove.push(*scid);
 				}
 			}
@@ -1877,6 +1887,8 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 				return Err(LightningError{err: "channel_update has a timestamp more than a day in the future".to_owned(), action: ErrorAction::IgnoreAndLog(Level::Gossip)});
 			}
 		}
+
+		log_gossip!(self.logger, "Updating channel {} in direction {} with timestamp {}", msg.short_channel_id, msg.flags & 1, msg.timestamp);
 
 		let mut channels = self.channels.write().unwrap();
 		match channels.get_mut(&msg.short_channel_id) {
@@ -3417,6 +3429,12 @@ pub(crate) mod tests {
 				.expect("to be able to read an old NodeAnnouncementInfo with addresses");
 		// This serialized info has an address field but no announcement_message, therefore the addresses returned by our function will still be empty
 		assert!(ann_info_with_addresses.addresses().is_empty());
+	}
+
+	#[test]
+	fn test_node_id_display() {
+		let node_id = NodeId([42; 33]);
+		assert_eq!(format!("{}", &node_id), "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a");
 	}
 }
 

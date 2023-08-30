@@ -82,6 +82,7 @@ use crate::sign::EntropySource;
 use crate::io;
 use crate::blinded_path::BlindedPath;
 use crate::ln::PaymentHash;
+use crate::ln::channelmanager::PaymentId;
 use crate::ln::features::InvoiceRequestFeatures;
 use crate::ln::inbound_payment::{ExpandedKey, IV_LEN, Nonce};
 use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
@@ -117,7 +118,7 @@ impl<'a> RefundBuilder<'a, secp256k1::SignOnly> {
 	/// Creates a new builder for a refund using the [`Refund::payer_id`] for the public node id to
 	/// send to if no [`Refund::paths`] are set. Otherwise, it may be a transient pubkey.
 	///
-	/// Additionally, sets the required [`Refund::description`], [`Refund::metadata`], and
+	/// Additionally, sets the required [`Refund::description`], [`Refund::payer_metadata`], and
 	/// [`Refund::amount_msats`].
 	pub fn new(
 		description: String, metadata: Vec<u8>, payer_id: PublicKey, amount_msats: u64
@@ -147,18 +148,22 @@ impl<'a, T: secp256k1::Signing> RefundBuilder<'a, T> {
 	/// Also, sets the metadata when [`RefundBuilder::build`] is called such that it can be used to
 	/// verify that an [`InvoiceRequest`] was produced for the refund given an [`ExpandedKey`].
 	///
+	/// The `payment_id` is encrypted in the metadata and should be unique. This ensures that only
+	/// one invoice will be paid for the refund and that payments can be uniquely identified.
+	///
 	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
 	/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
 	pub fn deriving_payer_id<ES: Deref>(
 		description: String, node_id: PublicKey, expanded_key: &ExpandedKey, entropy_source: ES,
-		secp_ctx: &'a Secp256k1<T>, amount_msats: u64
+		secp_ctx: &'a Secp256k1<T>, amount_msats: u64, payment_id: PaymentId
 	) -> Result<Self, Bolt12SemanticError> where ES::Target: EntropySource {
 		if amount_msats > MAX_VALUE_MSAT {
 			return Err(Bolt12SemanticError::InvalidAmount);
 		}
 
 		let nonce = Nonce::from_entropy_source(entropy_source);
-		let derivation_material = MetadataMaterial::new(nonce, expanded_key, IV_BYTES);
+		let payment_id = Some(payment_id);
+		let derivation_material = MetadataMaterial::new(nonce, expanded_key, IV_BYTES, payment_id);
 		let metadata = Metadata::DerivedSigningPubkey(derivation_material);
 		Ok(Self {
 			refund: RefundContents {
@@ -244,7 +249,7 @@ impl<'a, T: secp256k1::Signing> RefundBuilder<'a, T> {
 
 			let mut tlv_stream = self.refund.as_tlv_stream();
 			tlv_stream.0.metadata = None;
-			if metadata.derives_keys() {
+			if metadata.derives_payer_keys() {
 				tlv_stream.2.payer_id = None;
 			}
 
@@ -319,7 +324,7 @@ impl Refund {
 	///
 	/// If `None`, the refund does not expire.
 	pub fn absolute_expiry(&self) -> Option<Duration> {
-		self.contents.absolute_expiry
+		self.contents.absolute_expiry()
 	}
 
 	/// Whether the refund has expired.
@@ -331,43 +336,43 @@ impl Refund {
 	/// The issuer of the refund, possibly beginning with `user@domain` or `domain`. Intended to be
 	/// displayed to the user but with the caveat that it has not been verified in any way.
 	pub fn issuer(&self) -> Option<PrintableString> {
-		self.contents.issuer.as_ref().map(|issuer| PrintableString(issuer.as_str()))
+		self.contents.issuer()
 	}
 
 	/// Paths to the sender originating from publicly reachable nodes. Blinded paths provide sender
 	/// privacy by obfuscating its node id.
 	pub fn paths(&self) -> &[BlindedPath] {
-		self.contents.paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
+		self.contents.paths()
 	}
 
 	/// An unpredictable series of bytes, typically containing information about the derivation of
 	/// [`payer_id`].
 	///
 	/// [`payer_id`]: Self::payer_id
-	pub fn metadata(&self) -> &[u8] {
+	pub fn payer_metadata(&self) -> &[u8] {
 		self.contents.metadata()
 	}
 
 	/// A chain that the refund is valid for.
 	pub fn chain(&self) -> ChainHash {
-		self.contents.chain.unwrap_or_else(|| self.contents.implied_chain())
+		self.contents.chain()
 	}
 
 	/// The amount to refund in msats (i.e., the minimum lightning-payable unit for [`chain`]).
 	///
 	/// [`chain`]: Self::chain
 	pub fn amount_msats(&self) -> u64 {
-		self.contents.amount_msats
+		self.contents.amount_msats()
 	}
 
 	/// Features pertaining to requesting an invoice.
 	pub fn features(&self) -> &InvoiceRequestFeatures {
-		&self.contents.features
+		&self.contents.features()
 	}
 
 	/// The quantity of an item that refund is for.
 	pub fn quantity(&self) -> Option<u64> {
-		self.contents.quantity
+		self.contents.quantity()
 	}
 
 	/// A public node id to send to in the case where there are no [`paths`]. Otherwise, a possibly
@@ -375,12 +380,12 @@ impl Refund {
 	///
 	/// [`paths`]: Self::paths
 	pub fn payer_id(&self) -> PublicKey {
-		self.contents.payer_id
+		self.contents.payer_id()
 	}
 
 	/// Payer provided note to include in the invoice.
 	pub fn payer_note(&self) -> Option<PrintableString> {
-		self.contents.payer_note.as_ref().map(|payer_note| PrintableString(payer_note.as_str()))
+		self.contents.payer_note()
 	}
 
 	/// Creates an [`InvoiceBuilder`] for the refund with the given required fields and using the
@@ -503,6 +508,10 @@ impl RefundContents {
 		PrintableString(&self.description)
 	}
 
+	pub fn absolute_expiry(&self) -> Option<Duration> {
+		self.absolute_expiry
+	}
+
 	#[cfg(feature = "std")]
 	pub(super) fn is_expired(&self) -> bool {
 		match self.absolute_expiry {
@@ -512,6 +521,14 @@ impl RefundContents {
 			},
 			None => false,
 		}
+	}
+
+	pub fn issuer(&self) -> Option<PrintableString> {
+		self.issuer.as_ref().map(|issuer| PrintableString(issuer.as_str()))
+	}
+
+	pub fn paths(&self) -> &[BlindedPath] {
+		self.paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
 	}
 
 	pub(super) fn metadata(&self) -> &[u8] {
@@ -526,12 +543,35 @@ impl RefundContents {
 		ChainHash::using_genesis_block(Network::Bitcoin)
 	}
 
-	pub(super) fn derives_keys(&self) -> bool {
-		self.payer.0.derives_keys()
+	pub fn amount_msats(&self) -> u64 {
+		self.amount_msats
 	}
 
-	pub(super) fn payer_id(&self) -> PublicKey {
+	/// Features pertaining to requesting an invoice.
+	pub fn features(&self) -> &InvoiceRequestFeatures {
+		&self.features
+	}
+
+	/// The quantity of an item that refund is for.
+	pub fn quantity(&self) -> Option<u64> {
+		self.quantity
+	}
+
+	/// A public node id to send to in the case where there are no [`paths`]. Otherwise, a possibly
+	/// transient pubkey.
+	///
+	/// [`paths`]: Self::paths
+	pub fn payer_id(&self) -> PublicKey {
 		self.payer_id
+	}
+
+	/// Payer provided note to include in the invoice.
+	pub fn payer_note(&self) -> Option<PrintableString> {
+		self.payer_note.as_ref().map(|payer_note| PrintableString(payer_note.as_str()))
+	}
+
+	pub(super) fn derives_keys(&self) -> bool {
+		self.payer.0.derives_payer_keys()
 	}
 
 	pub(super) fn as_tlv_stream(&self) -> RefundTlvStreamRef {
@@ -713,6 +753,7 @@ mod tests {
 	use core::time::Duration;
 	use crate::blinded_path::{BlindedHop, BlindedPath};
 	use crate::sign::KeyMaterial;
+	use crate::ln::channelmanager::PaymentId;
 	use crate::ln::features::{InvoiceRequestFeatures, OfferFeatures};
 	use crate::ln::inbound_payment::ExpandedKey;
 	use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
@@ -745,7 +786,7 @@ mod tests {
 		refund.write(&mut buffer).unwrap();
 
 		assert_eq!(refund.bytes, buffer.as_slice());
-		assert_eq!(refund.metadata(), &[1; 32]);
+		assert_eq!(refund.payer_metadata(), &[1; 32]);
 		assert_eq!(refund.description(), PrintableString("foo"));
 		assert_eq!(refund.absolute_expiry(), None);
 		#[cfg(feature = "std")]
@@ -806,9 +847,10 @@ mod tests {
 		let expanded_key = ExpandedKey::new(&KeyMaterial([42; 32]));
 		let entropy = FixedEntropy {};
 		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
 
 		let refund = RefundBuilder
-			::deriving_payer_id(desc, node_id, &expanded_key, &entropy, &secp_ctx, 1000)
+			::deriving_payer_id(desc, node_id, &expanded_key, &entropy, &secp_ctx, 1000, payment_id)
 			.unwrap()
 			.build().unwrap();
 		assert_eq!(refund.payer_id(), node_id);
@@ -819,7 +861,10 @@ mod tests {
 			.unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
-		assert!(invoice.verify(&expanded_key, &secp_ctx));
+		match invoice.verify(&expanded_key, &secp_ctx) {
+			Ok(payment_id) => assert_eq!(payment_id, PaymentId([1; 32])),
+			Err(()) => panic!("verification failed"),
+		}
 
 		let mut tlv_stream = refund.as_tlv_stream();
 		tlv_stream.2.amount = Some(2000);
@@ -832,7 +877,7 @@ mod tests {
 			.unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
-		assert!(!invoice.verify(&expanded_key, &secp_ctx));
+		assert!(invoice.verify(&expanded_key, &secp_ctx).is_err());
 
 		// Fails verification with altered metadata
 		let mut tlv_stream = refund.as_tlv_stream();
@@ -847,7 +892,7 @@ mod tests {
 			.unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
-		assert!(!invoice.verify(&expanded_key, &secp_ctx));
+		assert!(invoice.verify(&expanded_key, &secp_ctx).is_err());
 	}
 
 	#[test]
@@ -857,6 +902,7 @@ mod tests {
 		let expanded_key = ExpandedKey::new(&KeyMaterial([42; 32]));
 		let entropy = FixedEntropy {};
 		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
 
 		let blinded_path = BlindedPath {
 			introduction_node_id: pubkey(40),
@@ -868,7 +914,7 @@ mod tests {
 		};
 
 		let refund = RefundBuilder
-			::deriving_payer_id(desc, node_id, &expanded_key, &entropy, &secp_ctx, 1000)
+			::deriving_payer_id(desc, node_id, &expanded_key, &entropy, &secp_ctx, 1000, payment_id)
 			.unwrap()
 			.path(blinded_path)
 			.build().unwrap();
@@ -879,7 +925,10 @@ mod tests {
 			.unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
-		assert!(invoice.verify(&expanded_key, &secp_ctx));
+		match invoice.verify(&expanded_key, &secp_ctx) {
+			Ok(payment_id) => assert_eq!(payment_id, PaymentId([1; 32])),
+			Err(()) => panic!("verification failed"),
+		}
 
 		// Fails verification with altered fields
 		let mut tlv_stream = refund.as_tlv_stream();
@@ -893,7 +942,7 @@ mod tests {
 			.unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
-		assert!(!invoice.verify(&expanded_key, &secp_ctx));
+		assert!(invoice.verify(&expanded_key, &secp_ctx).is_err());
 
 		// Fails verification with altered payer_id
 		let mut tlv_stream = refund.as_tlv_stream();
@@ -908,7 +957,7 @@ mod tests {
 			.unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
-		assert!(!invoice.verify(&expanded_key, &secp_ctx));
+		assert!(invoice.verify(&expanded_key, &secp_ctx).is_err());
 	}
 
 	#[test]

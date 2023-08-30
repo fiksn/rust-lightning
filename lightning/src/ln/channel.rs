@@ -22,7 +22,7 @@ use bitcoin::secp256k1::{PublicKey,SecretKey};
 use bitcoin::secp256k1::{Secp256k1,ecdsa::Signature};
 use bitcoin::secp256k1;
 
-use crate::ln::{PaymentPreimage, PaymentHash};
+use crate::ln::{ChannelId, PaymentPreimage, PaymentHash};
 use crate::ln::features::{ChannelTypeFeatures, InitFeatures};
 use crate::ln::msgs;
 use crate::ln::msgs::DecodeError;
@@ -35,7 +35,7 @@ use crate::chain::BestBlock;
 use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS, CLOSED_CHANNEL_UPDATE_ID};
 use crate::chain::transaction::{OutPoint, TransactionData};
-use crate::sign::{WriteableEcdsaChannelSigner, EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
+use crate::sign::{EcdsaChannelSigner, WriteableEcdsaChannelSigner, EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
 use crate::events::ClosureReason;
 use crate::routing::gossip::NodeId;
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer, VecWriter};
@@ -51,6 +51,7 @@ use core::ops::Deref;
 #[cfg(any(test, fuzzing, debug_assertions))]
 use crate::sync::Mutex;
 use bitcoin::hashes::hex::ToHex;
+use crate::sign::type_resolver::ChannelSignerType;
 
 #[cfg(test)]
 pub struct ChannelValueStat {
@@ -65,8 +66,6 @@ pub struct ChannelValueStat {
 }
 
 pub struct AvailableBalances {
-	/// The amount that would go to us if we close the channel, ignoring any on-chain fees.
-	pub balance_msat: u64,
 	/// Total amount available for our counterparty to send to us.
 	pub inbound_capacity_msat: u64,
 	/// Total amount available for us to send to our counterparty.
@@ -533,7 +532,7 @@ pub(super) struct ReestablishResponses {
 /// channel's counterparty_node_id and channel_id).
 pub(crate) type ShutdownResult = (
 	Option<(PublicKey, OutPoint, ChannelMonitorUpdate)>,
-	Vec<(HTLCSource, PaymentHash, PublicKey, [u8; 32])>
+	Vec<(HTLCSource, PaymentHash, PublicKey, ChannelId)>
 );
 
 /// If the majority of the channels funds are to the fundee and the initiator holds only just
@@ -626,7 +625,7 @@ impl UnfundedChannelContext {
 }
 
 /// Contains everything about the channel including state, and various flags.
-pub(super) struct ChannelContext<Signer: ChannelSigner> {
+pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	config: LegacyChannelConfig,
 
 	// Track the previous `ChannelConfig` so that we can continue forwarding HTLCs that were
@@ -638,8 +637,11 @@ pub(super) struct ChannelContext<Signer: ChannelSigner> {
 
 	user_id: u128,
 
-	channel_id: [u8; 32],
-	temporary_channel_id: Option<[u8; 32]>, // Will be `None` for channels created prior to 0.0.115.
+	/// The current channel ID.
+	channel_id: ChannelId,
+	/// The temporary channel ID used during channel setup. Value kept even after transitioning to a final channel ID.
+	/// Will be `None` for channels created prior to 0.0.115.
+	temporary_channel_id: Option<ChannelId>,
 	channel_state: u32,
 
 	// When we reach max(6 blocks, minimum_depth), we need to send an AnnouncementSigs message to
@@ -659,7 +661,7 @@ pub(super) struct ChannelContext<Signer: ChannelSigner> {
 
 	latest_monitor_update_id: u64,
 
-	holder_signer: Signer,
+	holder_signer: ChannelSignerType<<SP::Target as SignerProvider>::Signer>,
 	shutdown_scriptpubkey: Option<ShutdownScript>,
 	destination_script: Script,
 
@@ -739,19 +741,6 @@ pub(super) struct ChannelContext<Signer: ChannelSigner> {
 	pub(crate) closing_fee_limits: Option<(u64, u64)>,
 	#[cfg(not(test))]
 	closing_fee_limits: Option<(u64, u64)>,
-
-	/// Flag that ensures that `accept_inbound_channel` must be called before `funding_created`
-	/// is executed successfully. The reason for this flag is that when the
-	/// `UserConfig::manually_accept_inbound_channels` config flag is set to true, inbound channels
-	/// are required to be manually accepted by the node operator before the `msgs::AcceptChannel`
-	/// message is created and sent out. During the manual accept process, `accept_inbound_channel`
-	/// is called by `ChannelManager::accept_inbound_channel`.
-	///
-	/// The flag counteracts that a counterparty node could theoretically send a
-	/// `msgs::FundingCreated` message before the node operator has manually accepted an inbound
-	/// channel request made by the counterparty node. That would execute `funding_created` before
-	/// `accept_inbound_channel`, and `funding_created` should therefore not execute successfully.
-	inbound_awaiting_accept: bool,
 
 	/// The hash of the block in which the funding transaction was included.
 	funding_tx_confirmed_in: Option<BlockHash>,
@@ -898,7 +887,7 @@ pub(super) struct ChannelContext<Signer: ChannelSigner> {
 	blocked_monitor_updates: Vec<PendingChannelMonitorUpdate>,
 }
 
-impl<Signer: ChannelSigner> ChannelContext<Signer> {
+impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 	/// Allowed in any state (including after shutdown)
 	pub fn get_update_time_counter(&self) -> u32 {
 		self.update_time_counter
@@ -971,14 +960,14 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 
 	// Public utilities:
 
-	pub fn channel_id(&self) -> [u8; 32] {
+	pub fn channel_id(&self) -> ChannelId {
 		self.channel_id
 	}
 
 	// Return the `temporary_channel_id` used during channel establishment.
 	//
 	// Will return `None` for channels created prior to LDK version 0.0.115.
-	pub fn temporary_channel_id(&self) -> Option<[u8; 32]> {
+	pub fn temporary_channel_id(&self) -> Option<ChannelId> {
 		self.temporary_channel_id
 	}
 
@@ -1015,9 +1004,10 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 	}
 
 	/// Only allowed immediately after deserialization if get_outbound_scid_alias returns 0,
-	/// indicating we were written by LDK prior to 0.0.106 which did not set outbound SCID aliases.
+	/// indicating we were written by LDK prior to 0.0.106 which did not set outbound SCID aliases
+	/// or prior to any channel actions during `Channel` initialization.
 	pub fn set_outbound_scid_alias(&mut self, outbound_scid_alias: u64) {
-		assert_eq!(self.outbound_scid_alias, 0);
+		debug_assert_eq!(self.outbound_scid_alias, 0);
 		self.outbound_scid_alias = outbound_scid_alias;
 	}
 
@@ -1245,7 +1235,8 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 		log_trace!(logger, "Building commitment transaction number {} (really {} xor {}) for channel {} for {}, generated by {} with fee {}...",
 			commitment_number, (INITIAL_COMMITMENT_NUMBER - commitment_number),
 			get_commitment_transaction_number_obscure_factor(&self.get_holder_pubkeys().payment_point, &self.get_counterparty_pubkeys().payment_point, self.is_outbound()),
-			log_bytes!(self.channel_id), if local { "us" } else { "remote" }, if generated_by_local { "us" } else { "remote" }, feerate_per_kw);
+			&self.channel_id,
+			if local { "us" } else { "remote" }, if generated_by_local { "us" } else { "remote" }, feerate_per_kw);
 
 		macro_rules! get_htlc_in_commitment {
 			($htlc: expr, $offered: expr) => {
@@ -1269,10 +1260,10 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 						feerate_per_kw as u64 * htlc_timeout_tx_weight(self.get_channel_type()) / 1000
 					};
 					if $htlc.amount_msat / 1000 >= broadcaster_dust_limit_satoshis + htlc_tx_fee {
-						log_trace!(logger, "   ...including {} {} HTLC {} (hash {}) with value {}", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, log_bytes!($htlc.payment_hash.0), $htlc.amount_msat);
+						log_trace!(logger, "   ...including {} {} HTLC {} (hash {}) with value {}", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, &$htlc.payment_hash, $htlc.amount_msat);
 						included_non_dust_htlcs.push((htlc_in_tx, $source));
 					} else {
-						log_trace!(logger, "   ...including {} {} dust HTLC {} (hash {}) with value {} due to dust limit", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, log_bytes!($htlc.payment_hash.0), $htlc.amount_msat);
+						log_trace!(logger, "   ...including {} {} dust HTLC {} (hash {}) with value {} due to dust limit", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, &$htlc.payment_hash, $htlc.amount_msat);
 						included_dust_htlcs.push((htlc_in_tx, $source));
 					}
 				} else {
@@ -1283,10 +1274,10 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 						feerate_per_kw as u64 * htlc_success_tx_weight(self.get_channel_type()) / 1000
 					};
 					if $htlc.amount_msat / 1000 >= broadcaster_dust_limit_satoshis + htlc_tx_fee {
-						log_trace!(logger, "   ...including {} {} HTLC {} (hash {}) with value {}", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, log_bytes!($htlc.payment_hash.0), $htlc.amount_msat);
+						log_trace!(logger, "   ...including {} {} HTLC {} (hash {}) with value {}", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, &$htlc.payment_hash, $htlc.amount_msat);
 						included_non_dust_htlcs.push((htlc_in_tx, $source));
 					} else {
-						log_trace!(logger, "   ...including {} {} dust HTLC {} (hash {}) with value {}", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, log_bytes!($htlc.payment_hash.0), $htlc.amount_msat);
+						log_trace!(logger, "   ...including {} {} dust HTLC {} (hash {}) with value {}", if $outbound { "outbound" } else { "inbound" }, $state_name, $htlc.htlc_id, &$htlc.payment_hash, $htlc.amount_msat);
 						included_dust_htlcs.push((htlc_in_tx, $source));
 					}
 				}
@@ -1306,7 +1297,7 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 				add_htlc_output!(htlc, false, None, state_name);
 				remote_htlc_total_msat += htlc.amount_msat;
 			} else {
-				log_trace!(logger, "   ...not including inbound HTLC {} (hash {}) with value {} due to state ({})", htlc.htlc_id, log_bytes!(htlc.payment_hash.0), htlc.amount_msat, state_name);
+				log_trace!(logger, "   ...not including inbound HTLC {} (hash {}) with value {} due to state ({})", htlc.htlc_id, &htlc.payment_hash, htlc.amount_msat, state_name);
 				match &htlc.state {
 					&InboundHTLCState::LocalRemoved(ref reason) => {
 						if generated_by_local {
@@ -1346,7 +1337,7 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 				add_htlc_output!(htlc, true, Some(&htlc.source), state_name);
 				local_htlc_total_msat += htlc.amount_msat;
 			} else {
-				log_trace!(logger, "   ...not including outbound HTLC {} (hash {}) with value {} due to state ({})", htlc.htlc_id, log_bytes!(htlc.payment_hash.0), htlc.amount_msat, state_name);
+				log_trace!(logger, "   ...not including outbound HTLC {} (hash {}) with value {} due to state ({})", htlc.htlc_id, &htlc.payment_hash, htlc.amount_msat, state_name);
 				match htlc.state {
 					OutboundHTLCState::AwaitingRemoteRevokeToRemove(OutboundHTLCOutcome::Success(_))|OutboundHTLCState::AwaitingRemovedRemoteRevoke(OutboundHTLCOutcome::Success(_)) => {
 						value_to_self_msat_offset -= htlc.amount_msat as i64;
@@ -1456,7 +1447,7 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 	/// The result is a transaction which we can revoke broadcastership of (ie a "local" transaction)
 	/// TODO Some magic rust shit to compile-time check this?
 	fn build_holder_transaction_keys(&self, commitment_number: u64) -> TxCreationKeys {
-		let per_commitment_point = self.holder_signer.get_per_commitment_point(commitment_number, &self.secp_ctx);
+		let per_commitment_point = self.holder_signer.as_ref().get_per_commitment_point(commitment_number, &self.secp_ctx);
 		let delayed_payment_base = &self.get_holder_pubkeys().delayed_payment_basepoint;
 		let htlc_basepoint = &self.get_holder_pubkeys().htlc_basepoint;
 		let counterparty_pubkeys = self.get_counterparty_pubkeys();
@@ -1611,14 +1602,6 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 		let inbound_stats = context.get_inbound_pending_htlc_stats(None);
 		let outbound_stats = context.get_outbound_pending_htlc_stats(None);
 
-		let mut balance_msat = context.value_to_self_msat;
-		for ref htlc in context.pending_inbound_htlcs.iter() {
-			if let InboundHTLCState::LocalRemoved(InboundHTLCRemovalReason::Fulfill(_)) = htlc.state {
-				balance_msat += htlc.amount_msat;
-			}
-		}
-		balance_msat -= outbound_stats.pending_htlcs_value_msat;
-
 		let outbound_capacity_msat = context.value_to_self_msat
 				.saturating_sub(outbound_stats.pending_htlcs_value_msat)
 				.saturating_sub(
@@ -1735,7 +1718,6 @@ impl<Signer: ChannelSigner> ChannelContext<Signer> {
 			outbound_capacity_msat,
 			next_outbound_htlc_limit_msat: available_capacity_msat,
 			next_outbound_htlc_minimum_msat,
-			balance_msat,
 		}
 	}
 
@@ -2058,8 +2040,8 @@ fn commit_tx_fee_msat(feerate_per_kw: u32, num_htlcs: usize, channel_type_featur
 //
 // Holder designates channel data owned for the benefit of the user client.
 // Counterparty designates channel data owned by the another channel participant entity.
-pub(super) struct Channel<Signer: ChannelSigner> {
-	pub context: ChannelContext<Signer>,
+pub(super) struct Channel<SP: Deref> where SP::Target: SignerProvider {
+	pub context: ChannelContext<SP>,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -2071,7 +2053,10 @@ struct CommitmentTxInfoCached {
 	feerate: u32,
 }
 
-impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
+impl<SP: Deref> Channel<SP> where
+	SP::Target: SignerProvider,
+	<SP::Target as SignerProvider>::Signer: WriteableEcdsaChannelSigner
+{
 	fn check_remote_fee<F: Deref, L: Deref>(
 		channel_type: &ChannelTypeFeatures, fee_estimator: &LowerBoundedFeeEstimator<F>,
 		feerate_per_kw: u32, cur_feerate_per_kw: Option<u32>, logger: &L
@@ -2225,8 +2210,6 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		}
 		assert_eq!(self.context.channel_state & ChannelState::ShutdownComplete as u32, 0);
 
-		let payment_hash_calc = PaymentHash(Sha256::hash(&payment_preimage_arg.0[..]).into_inner());
-
 		// ChannelManager may generate duplicate claims/fails due to HTLC update events from
 		// on-chain ChannelsMonitors during block rescan. Ideally we'd figure out a way to drop
 		// these, but for now we just have to treat them as normal.
@@ -2235,13 +2218,15 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let mut htlc_value_msat = 0;
 		for (idx, htlc) in self.context.pending_inbound_htlcs.iter().enumerate() {
 			if htlc.htlc_id == htlc_id_arg {
-				assert_eq!(htlc.payment_hash, payment_hash_calc);
+				debug_assert_eq!(htlc.payment_hash, PaymentHash(Sha256::hash(&payment_preimage_arg.0[..]).into_inner()));
+				log_debug!(logger, "Claiming inbound HTLC id {} with payment hash {} with preimage {}",
+					htlc.htlc_id, htlc.payment_hash, payment_preimage_arg);
 				match htlc.state {
 					InboundHTLCState::Committed => {},
 					InboundHTLCState::LocalRemoved(ref reason) => {
 						if let &InboundHTLCRemovalReason::Fulfill(_) = reason {
 						} else {
-							log_warn!(logger, "Have preimage and want to fulfill HTLC with payment hash {} we already failed against channel {}", log_bytes!(htlc.payment_hash.0), log_bytes!(self.context.channel_id()));
+							log_warn!(logger, "Have preimage and want to fulfill HTLC with payment hash {} we already failed against channel {}", &htlc.payment_hash, &self.context.channel_id());
 							debug_assert!(false, "Tried to fulfill an HTLC that was already failed");
 						}
 						return UpdateFulfillFetch::DuplicateClaim {};
@@ -2294,7 +2279,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					},
 					&HTLCUpdateAwaitingACK::FailHTLC { htlc_id, .. } => {
 						if htlc_id_arg == htlc_id {
-							log_warn!(logger, "Have preimage and want to fulfill HTLC with pending failure against channel {}", log_bytes!(self.context.channel_id()));
+							log_warn!(logger, "Have preimage and want to fulfill HTLC with pending failure against channel {}", &self.context.channel_id());
 							// TODO: We may actually be able to switch to a fulfill here, though its
 							// rare enough it may not be worth the complexity burden.
 							debug_assert!(false, "Tried to fulfill an HTLC that was already failed");
@@ -2304,7 +2289,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					_ => {}
 				}
 			}
-			log_trace!(logger, "Adding HTLC claim to holding_cell in channel {}! Current state: {}", log_bytes!(self.context.channel_id()), self.context.channel_state);
+			log_trace!(logger, "Adding HTLC claim to holding_cell in channel {}! Current state: {}", &self.context.channel_id(), self.context.channel_state);
 			self.context.holding_cell_htlc_updates.push(HTLCUpdateAwaitingACK::ClaimHTLC {
 				payment_preimage: payment_preimage_arg, htlc_id: htlc_id_arg,
 			});
@@ -2322,7 +2307,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				debug_assert!(false, "Have an inbound HTLC we tried to claim before it was fully committed to");
 				return UpdateFulfillFetch::NewClaim { monitor_update, htlc_value_msat, msg: None };
 			}
-			log_trace!(logger, "Upgrading HTLC {} to LocalRemoved with a Fulfill in channel {}!", log_bytes!(htlc.payment_hash.0), log_bytes!(self.context.channel_id));
+			log_trace!(logger, "Upgrading HTLC {} to LocalRemoved with a Fulfill in channel {}!", &htlc.payment_hash, &self.context.channel_id);
 			htlc.state = InboundHTLCState::LocalRemoved(InboundHTLCRemovalReason::Fulfill(payment_preimage_arg.clone()));
 		}
 
@@ -2461,7 +2446,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					_ => {}
 				}
 			}
-			log_trace!(logger, "Placing failure for HTLC ID {} in holding cell in channel {}.", htlc_id_arg, log_bytes!(self.context.channel_id()));
+			log_trace!(logger, "Placing failure for HTLC ID {} in holding cell in channel {}.", htlc_id_arg, &self.context.channel_id());
 			self.context.holding_cell_htlc_updates.push(HTLCUpdateAwaitingACK::FailHTLC {
 				htlc_id: htlc_id_arg,
 				err_packet,
@@ -2469,7 +2454,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			return Ok(None);
 		}
 
-		log_trace!(logger, "Failing HTLC ID {} back with a update_fail_htlc message in channel {}.", htlc_id_arg, log_bytes!(self.context.channel_id()));
+		log_trace!(logger, "Failing HTLC ID {} back with a update_fail_htlc message in channel {}.", htlc_id_arg, &self.context.channel_id());
 		{
 			let htlc = &mut self.context.pending_inbound_htlcs[pending_idx];
 			htlc.state = InboundHTLCState::LocalRemoved(InboundHTLCRemovalReason::FailRelay(err_packet.clone()));
@@ -2486,11 +2471,10 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 	/// Handles a funding_signed message from the remote end.
 	/// If this call is successful, broadcast the funding transaction (and not before!)
-	pub fn funding_signed<SP: Deref, L: Deref>(
+	pub fn funding_signed<L: Deref>(
 		&mut self, msg: &msgs::FundingSigned, best_block: BestBlock, signer_provider: &SP, logger: &L
-	) -> Result<ChannelMonitor<Signer>, ChannelError>
+	) -> Result<ChannelMonitor<<SP::Target as SignerProvider>::Signer>, ChannelError>
 	where
-		SP::Target: SignerProvider<Signer = Signer>,
 		L::Target: Logger
 	{
 		if !self.context.is_outbound() {
@@ -2513,7 +2497,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
 
 		log_trace!(logger, "Initial counterparty tx for channel {} is: txid {} tx {}",
-			log_bytes!(self.context.channel_id()), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
+			&self.context.channel_id(), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
 
 		let holder_signer = self.context.build_holder_transaction_keys(self.context.cur_holder_commitment_transaction_number);
 		let initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_holder_commitment_transaction_number, &holder_signer, true, false, logger).tx;
@@ -2535,7 +2519,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			self.context.counterparty_funding_pubkey()
 		);
 
-		self.context.holder_signer.validate_holder_commitment(&holder_commitment_tx, Vec::new())
+		self.context.holder_signer.as_ref().validate_holder_commitment(&holder_commitment_tx, Vec::new())
 			.map_err(|_| ChannelError::Close("Failed to validate our commitment".to_owned()))?;
 
 
@@ -2554,14 +2538,20 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		                                          obscure_factor,
 		                                          holder_commitment_tx, best_block, self.context.counterparty_node_id);
 
-		channel_monitor.provide_latest_counterparty_commitment_tx(counterparty_initial_bitcoin_tx.txid, Vec::new(), self.context.cur_counterparty_commitment_transaction_number, self.context.counterparty_cur_commitment_point.unwrap(), logger);
+		channel_monitor.provide_initial_counterparty_commitment_tx(
+			counterparty_initial_bitcoin_tx.txid, Vec::new(),
+			self.context.cur_counterparty_commitment_transaction_number,
+			self.context.counterparty_cur_commitment_point.unwrap(),
+			counterparty_initial_commitment_tx.feerate_per_kw(),
+			counterparty_initial_commitment_tx.to_broadcaster_value_sat(),
+			counterparty_initial_commitment_tx.to_countersignatory_value_sat(), logger);
 
 		assert_eq!(self.context.channel_state & (ChannelState::MonitorUpdateInProgress as u32), 0); // We have no had any monitor(s) yet to fail update!
 		self.context.channel_state = ChannelState::FundingSent as u32;
 		self.context.cur_holder_commitment_transaction_number -= 1;
 		self.context.cur_counterparty_commitment_transaction_number -= 1;
 
-		log_info!(logger, "Received funding_signed from peer for channel {}", log_bytes!(self.context.channel_id()));
+		log_info!(logger, "Received funding_signed from peer for channel {}", &self.context.channel_id());
 
 		let need_channel_ready = self.check_get_channel_ready(0).is_some();
 		self.monitor_updating_paused(false, false, need_channel_ready, Vec::new(), Vec::new(), Vec::new());
@@ -2635,7 +2625,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		self.context.counterparty_prev_commitment_point = self.context.counterparty_cur_commitment_point;
 		self.context.counterparty_cur_commitment_point = Some(msg.next_per_commitment_point);
 
-		log_info!(logger, "Received channel_ready from peer for channel {}", log_bytes!(self.context.channel_id()));
+		log_info!(logger, "Received channel_ready from peer for channel {}", &self.context.channel_id());
 
 		Ok(self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, best_block.height(), logger))
 	}
@@ -2763,7 +2753,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			if pending_remote_value_msat - msg.amount_msat - self.context.holder_selected_channel_reserve_satoshis * 1000 < remote_fee_cost_incl_stuck_buffer_msat {
 				// Note that if the pending_forward_status is not updated here, then it's because we're already failing
 				// the HTLC, i.e. its status is already set to failing.
-				log_info!(logger, "Attempting to fail HTLC due to fee spike buffer violation in channel {}. Rebalancing is required.", log_bytes!(self.context.channel_id()));
+				log_info!(logger, "Attempting to fail HTLC due to fee spike buffer violation in channel {}. Rebalancing is required.", &self.context.channel_id());
 				pending_forward_status = create_pending_htlc_status(self, pending_forward_status, 0x1000|7);
 			}
 		} else {
@@ -2891,7 +2881,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			log_trace!(logger, "Checking commitment tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}",
 				log_bytes!(msg.signature.serialize_compact()[..]),
 				log_bytes!(self.context.counterparty_funding_pubkey().serialize()), encode::serialize_hex(&bitcoin_tx.transaction),
-				log_bytes!(sighash[..]), encode::serialize_hex(&funding_script), log_bytes!(self.context.channel_id()));
+				log_bytes!(sighash[..]), encode::serialize_hex(&funding_script), &self.context.channel_id());
 			if let Err(_) = self.context.secp_ctx.verify_ecdsa(&sighash, &msg.signature, &self.context.counterparty_funding_pubkey()) {
 				return Err(ChannelError::Close("Invalid commitment tx signature from peer".to_owned()));
 			}
@@ -2961,7 +2951,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				let htlc_sighash = hash_to_message!(&sighash::SighashCache::new(&htlc_tx).segwit_signature_hash(0, &htlc_redeemscript, htlc.amount_msat / 1000, htlc_sighashtype).unwrap()[..]);
 				log_trace!(logger, "Checking HTLC tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}.",
 					log_bytes!(msg.htlc_signatures[idx].serialize_compact()[..]), log_bytes!(keys.countersignatory_htlc_key.serialize()),
-					encode::serialize_hex(&htlc_tx), log_bytes!(htlc_sighash[..]), encode::serialize_hex(&htlc_redeemscript), log_bytes!(self.context.channel_id()));
+					encode::serialize_hex(&htlc_tx), log_bytes!(htlc_sighash[..]), encode::serialize_hex(&htlc_redeemscript), &self.context.channel_id());
 				if let Err(_) = self.context.secp_ctx.verify_ecdsa(&htlc_sighash, &msg.htlc_signatures[idx], &keys.countersignatory_htlc_key) {
 					return Err(ChannelError::Close("Invalid HTLC tx signature from peer".to_owned()));
 				}
@@ -2987,7 +2977,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			self.context.counterparty_funding_pubkey()
 		);
 
-		self.context.holder_signer.validate_holder_commitment(&holder_commitment_tx, commitment_stats.preimages)
+		self.context.holder_signer.as_ref().validate_holder_commitment(&holder_commitment_tx, commitment_stats.preimages)
 			.map_err(|_| ChannelError::Close("Failed to validate our commitment".to_owned()))?;
 
 		// Update state now that we've passed all the can-fail calls...
@@ -3005,7 +2995,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			} else { None };
 			if let Some(forward_info) = new_forward {
 				log_trace!(logger, "Updating HTLC {} to AwaitingRemoteRevokeToAnnounce due to commitment_signed in channel {}.",
-					log_bytes!(htlc.payment_hash.0), log_bytes!(self.context.channel_id));
+					&htlc.payment_hash, &self.context.channel_id);
 				htlc.state = InboundHTLCState::AwaitingRemoteRevokeToAnnounce(forward_info);
 				need_commitment = true;
 			}
@@ -3014,7 +3004,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		for htlc in self.context.pending_outbound_htlcs.iter_mut() {
 			if let &mut OutboundHTLCState::RemoteRemoved(ref mut outcome) = &mut htlc.state {
 				log_trace!(logger, "Updating HTLC {} to AwaitingRemoteRevokeToRemove due to commitment_signed in channel {}.",
-					log_bytes!(htlc.payment_hash.0), log_bytes!(self.context.channel_id));
+					&htlc.payment_hash, &self.context.channel_id);
 				// Grab the preimage, if it exists, instead of cloning
 				let mut reason = OutboundHTLCOutcome::Success(None);
 				mem::swap(outcome, &mut reason);
@@ -3064,7 +3054,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				monitor_update.updates.append(&mut additional_update.updates);
 			}
 			log_debug!(logger, "Received valid commitment_signed from peer in channel {}, updated HTLC state but awaiting a monitor update resolution to reply.",
-				log_bytes!(self.context.channel_id));
+				&self.context.channel_id);
 			return Ok(self.push_ret_blockable_mon_update(monitor_update));
 		}
 
@@ -3081,7 +3071,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		} else { false };
 
 		log_debug!(logger, "Received valid commitment_signed from peer in channel {}, updating HTLC state and responding with{} a revoke_and_ack.",
-			log_bytes!(self.context.channel_id()), if need_commitment_signed { " our own commitment_signed and" } else { "" });
+			&self.context.channel_id(), if need_commitment_signed { " our own commitment_signed and" } else { "" });
 		self.monitor_updating_paused(true, need_commitment_signed, false, Vec::new(), Vec::new(), Vec::new());
 		return Ok(self.push_ret_blockable_mon_update(monitor_update));
 	}
@@ -3110,7 +3100,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		assert_eq!(self.context.channel_state & ChannelState::MonitorUpdateInProgress as u32, 0);
 		if self.context.holding_cell_htlc_updates.len() != 0 || self.context.holding_cell_update_fee.is_some() {
 			log_trace!(logger, "Freeing holding cell with {} HTLC updates{} in channel {}", self.context.holding_cell_htlc_updates.len(),
-				if self.context.holding_cell_update_fee.is_some() { " and a fee update" } else { "" }, log_bytes!(self.context.channel_id()));
+				if self.context.holding_cell_update_fee.is_some() { " and a fee update" } else { "" }, &self.context.channel_id());
 
 			let mut monitor_update = ChannelMonitorUpdate {
 				update_id: self.context.latest_monitor_update_id + 1, // We don't increment this yet!
@@ -3119,9 +3109,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 			let mut htlc_updates = Vec::new();
 			mem::swap(&mut htlc_updates, &mut self.context.holding_cell_htlc_updates);
-			let mut update_add_htlcs = Vec::with_capacity(htlc_updates.len());
-			let mut update_fulfill_htlcs = Vec::with_capacity(htlc_updates.len());
-			let mut update_fail_htlcs = Vec::with_capacity(htlc_updates.len());
+			let mut update_add_count = 0;
+			let mut update_fulfill_count = 0;
+			let mut update_fail_count = 0;
 			let mut htlcs_to_fail = Vec::new();
 			for htlc_update in htlc_updates.drain(..) {
 				// Note that this *can* fail, though it should be due to rather-rare conditions on
@@ -3137,12 +3127,11 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 						match self.send_htlc(amount_msat, *payment_hash, cltv_expiry, source.clone(),
 							onion_routing_packet.clone(), false, skimmed_fee_msat, fee_estimator, logger)
 						{
-							Ok(update_add_msg_option) => update_add_htlcs.push(update_add_msg_option.unwrap()),
+							Ok(_) => update_add_count += 1,
 							Err(e) => {
 								match e {
 									ChannelError::Ignore(ref msg) => {
-										log_info!(logger, "Failed to send HTLC with payment_hash {} due to {} in channel {}",
-											log_bytes!(payment_hash.0), msg, log_bytes!(self.context.channel_id()));
+										log_info!(logger, "Failed to send HTLC with payment_hash {} due to {} in channel {}", &payment_hash, msg, &self.context.channel_id());
 										// If we fail to send here, then this HTLC should
 										// be failed backwards. Failing to send here
 										// indicates that this HTLC may keep being put back
@@ -3164,11 +3153,11 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 						// not fail - any in between attempts to claim the HTLC will have resulted
 						// in it hitting the holding cell again and we cannot change the state of a
 						// holding cell HTLC from fulfill to anything else.
-						let (update_fulfill_msg_option, mut additional_monitor_update) =
-							if let UpdateFulfillFetch::NewClaim { msg, monitor_update, .. } = self.get_update_fulfill_htlc(htlc_id, *payment_preimage, logger) {
-								(msg, monitor_update)
-							} else { unreachable!() };
-						update_fulfill_htlcs.push(update_fulfill_msg_option.unwrap());
+						let mut additional_monitor_update =
+							if let UpdateFulfillFetch::NewClaim { monitor_update, .. } =
+								self.get_update_fulfill_htlc(htlc_id, *payment_preimage, logger)
+							{ monitor_update } else { unreachable!() };
+						update_fulfill_count += 1;
 						monitor_update.updates.append(&mut additional_monitor_update.updates);
 					},
 					&HTLCUpdateAwaitingACK::FailHTLC { htlc_id, ref err_packet } => {
@@ -3179,7 +3168,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 								// not fail - we should never end up in a state where we double-fail
 								// an HTLC or fail-then-claim an HTLC as it indicates we didn't wait
 								// for a full revocation before failing.
-								update_fail_htlcs.push(update_fail_msg_option.unwrap())
+								debug_assert!(update_fail_msg_option.is_some());
+								update_fail_count += 1;
 							},
 							Err(e) => {
 								if let ChannelError::Ignore(_) = e {}
@@ -3191,7 +3181,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					},
 				}
 			}
-			if update_add_htlcs.is_empty() && update_fulfill_htlcs.is_empty() && update_fail_htlcs.is_empty() && self.context.holding_cell_update_fee.is_none() {
+			if update_add_count == 0 && update_fulfill_count == 0 && update_fail_count == 0 && self.context.holding_cell_update_fee.is_none() {
 				return (None, htlcs_to_fail);
 			}
 			let update_fee = if let Some(feerate) = self.context.holding_cell_update_fee.take() {
@@ -3207,8 +3197,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			monitor_update.updates.append(&mut additional_update.updates);
 
 			log_debug!(logger, "Freeing holding cell in channel {} resulted in {}{} HTLCs added, {} HTLCs fulfilled, and {} HTLCs failed.",
-				log_bytes!(self.context.channel_id()), if update_fee.is_some() { "a fee update, " } else { "" },
-				update_add_htlcs.len(), update_fulfill_htlcs.len(), update_fail_htlcs.len());
+				&self.context.channel_id(), if update_fee.is_some() { "a fee update, " } else { "" },
+				update_add_count, update_fulfill_count, update_fail_count);
 
 			self.monitor_updating_paused(false, true, false, Vec::new(), Vec::new(), Vec::new());
 			(self.push_ret_blockable_mon_update(monitor_update), htlcs_to_fail)
@@ -3223,7 +3213,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	/// generating an appropriate error *after* the channel state has been updated based on the
 	/// revoke_and_ack message.
 	pub fn revoke_and_ack<F: Deref, L: Deref>(&mut self, msg: &msgs::RevokeAndACK,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L, hold_mon_update: bool,
 	) -> Result<(Vec<(HTLCSource, PaymentHash)>, Option<ChannelMonitorUpdate>), ChannelError>
 	where F::Target: FeeEstimator, L::Target: Logger,
 	{
@@ -3262,10 +3252,14 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			*self.context.next_remote_commitment_tx_fee_info_cached.lock().unwrap() = None;
 		}
 
-		self.context.holder_signer.validate_counterparty_revocation(
-			self.context.cur_counterparty_commitment_transaction_number + 1,
-			&secret
-		).map_err(|_| ChannelError::Close("Failed to validate revocation from peer".to_owned()))?;
+		match &self.context.holder_signer {
+			ChannelSignerType::Ecdsa(ecdsa) => {
+				ecdsa.validate_counterparty_revocation(
+					self.context.cur_counterparty_commitment_transaction_number + 1,
+					&secret
+				).map_err(|_| ChannelError::Close("Failed to validate revocation from peer".to_owned()))?;
+			}
+		};
 
 		self.context.commitment_secrets.provide_secret(self.context.cur_counterparty_commitment_transaction_number + 1, msg.per_commitment_secret)
 			.map_err(|_| ChannelError::Close("Previous secrets did not match new one".to_owned()))?;
@@ -3292,7 +3286,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			self.context.announcement_sigs_state = AnnouncementSigsState::PeerReceived;
 		}
 
-		log_trace!(logger, "Updating HTLCs on receipt of RAA in channel {}...", log_bytes!(self.context.channel_id()));
+		log_trace!(logger, "Updating HTLCs on receipt of RAA in channel {}...", &self.context.channel_id());
 		let mut to_forward_infos = Vec::new();
 		let mut revoked_htlcs = Vec::new();
 		let mut finalized_claimed_htlcs = Vec::new();
@@ -3309,7 +3303,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			// We really shouldnt have two passes here, but retain gives a non-mutable ref (Rust bug)
 			pending_inbound_htlcs.retain(|htlc| {
 				if let &InboundHTLCState::LocalRemoved(ref reason) = &htlc.state {
-					log_trace!(logger, " ...removing inbound LocalRemoved {}", log_bytes!(htlc.payment_hash.0));
+					log_trace!(logger, " ...removing inbound LocalRemoved {}", &htlc.payment_hash);
 					if let &InboundHTLCRemovalReason::Fulfill(_) = reason {
 						value_to_self_msat_diff += htlc.amount_msat as i64;
 					}
@@ -3318,7 +3312,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			});
 			pending_outbound_htlcs.retain(|htlc| {
 				if let &OutboundHTLCState::AwaitingRemovedRemoteRevoke(ref outcome) = &htlc.state {
-					log_trace!(logger, " ...removing outbound AwaitingRemovedRemoteRevoke {}", log_bytes!(htlc.payment_hash.0));
+					log_trace!(logger, " ...removing outbound AwaitingRemovedRemoteRevoke {}", &htlc.payment_hash);
 					if let OutboundHTLCOutcome::Failure(reason) = outcome.clone() { // We really want take() here, but, again, non-mut ref :(
 						revoked_htlcs.push((htlc.source.clone(), htlc.payment_hash, reason));
 					} else {
@@ -3340,13 +3334,13 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					mem::swap(&mut state, &mut htlc.state);
 
 					if let InboundHTLCState::AwaitingRemoteRevokeToAnnounce(forward_info) = state {
-						log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", log_bytes!(htlc.payment_hash.0));
+						log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", &htlc.payment_hash);
 						htlc.state = InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info);
 						require_commitment = true;
 					} else if let InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info) = state {
 						match forward_info {
 							PendingHTLCStatus::Fail(fail_msg) => {
-								log_trace!(logger, " ...promoting inbound AwaitingAnnouncedRemoteRevoke {} to LocalRemoved due to PendingHTLCStatus indicating failure", log_bytes!(htlc.payment_hash.0));
+								log_trace!(logger, " ...promoting inbound AwaitingAnnouncedRemoteRevoke {} to LocalRemoved due to PendingHTLCStatus indicating failure", &htlc.payment_hash);
 								require_commitment = true;
 								match fail_msg {
 									HTLCFailureMsg::Relay(msg) => {
@@ -3360,7 +3354,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 								}
 							},
 							PendingHTLCStatus::Forward(forward_info) => {
-								log_trace!(logger, " ...promoting inbound AwaitingAnnouncedRemoteRevoke {} to Committed", log_bytes!(htlc.payment_hash.0));
+								log_trace!(logger, " ...promoting inbound AwaitingAnnouncedRemoteRevoke {} to Committed", &htlc.payment_hash);
 								to_forward_infos.push((forward_info, htlc.htlc_id));
 								htlc.state = InboundHTLCState::Committed;
 							}
@@ -3370,11 +3364,11 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			}
 			for htlc in pending_outbound_htlcs.iter_mut() {
 				if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
-					log_trace!(logger, " ...promoting outbound LocalAnnounced {} to Committed", log_bytes!(htlc.payment_hash.0));
+					log_trace!(logger, " ...promoting outbound LocalAnnounced {} to Committed", &htlc.payment_hash);
 					htlc.state = OutboundHTLCState::Committed;
 				}
 				if let &mut OutboundHTLCState::AwaitingRemoteRevokeToRemove(ref mut outcome) = &mut htlc.state {
-					log_trace!(logger, " ...promoting outbound AwaitingRemoteRevokeToRemove {} to AwaitingRemovedRemoteRevoke", log_bytes!(htlc.payment_hash.0));
+					log_trace!(logger, " ...promoting outbound AwaitingRemoteRevokeToRemove {} to AwaitingRemovedRemoteRevoke", &htlc.payment_hash);
 					// Grab the preimage, if it exists, instead of cloning
 					let mut reason = OutboundHTLCOutcome::Success(None);
 					mem::swap(outcome, &mut reason);
@@ -3404,6 +3398,22 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			}
 		}
 
+		let release_monitor = self.context.blocked_monitor_updates.is_empty() && !hold_mon_update;
+		let release_state_str =
+			if hold_mon_update { "Holding" } else if release_monitor { "Releasing" } else { "Blocked" };
+		macro_rules! return_with_htlcs_to_fail {
+			($htlcs_to_fail: expr) => {
+				if !release_monitor {
+					self.context.blocked_monitor_updates.push(PendingChannelMonitorUpdate {
+						update: monitor_update,
+					});
+					return Ok(($htlcs_to_fail, None));
+				} else {
+					return Ok(($htlcs_to_fail, Some(monitor_update)));
+				}
+			}
+		}
+
 		if (self.context.channel_state & ChannelState::MonitorUpdateInProgress as u32) == ChannelState::MonitorUpdateInProgress as u32 {
 			// We can't actually generate a new commitment transaction (incl by freeing holding
 			// cells) while we can't update the monitor, so we just return what we have.
@@ -3421,8 +3431,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			self.context.monitor_pending_forwards.append(&mut to_forward_infos);
 			self.context.monitor_pending_failures.append(&mut revoked_htlcs);
 			self.context.monitor_pending_finalized_fulfills.append(&mut finalized_claimed_htlcs);
-			log_debug!(logger, "Received a valid revoke_and_ack for channel {} but awaiting a monitor update resolution to reply.", log_bytes!(self.context.channel_id()));
-			return Ok((Vec::new(), self.push_ret_blockable_mon_update(monitor_update)));
+			log_debug!(logger, "Received a valid revoke_and_ack for channel {} but awaiting a monitor update resolution to reply.", &self.context.channel_id());
+			return_with_htlcs_to_fail!(Vec::new());
 		}
 
 		match self.free_holding_cell_htlcs(fee_estimator, logger) {
@@ -3432,8 +3442,11 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				self.context.latest_monitor_update_id = monitor_update.update_id;
 				monitor_update.updates.append(&mut additional_update.updates);
 
+				log_debug!(logger, "Received a valid revoke_and_ack for channel {} with holding cell HTLCs freed. {} monitor update.",
+					&self.context.channel_id(), release_state_str);
+
 				self.monitor_updating_paused(false, true, false, to_forward_infos, revoked_htlcs, finalized_claimed_htlcs);
-				Ok((htlcs_to_fail, self.push_ret_blockable_mon_update(monitor_update)))
+				return_with_htlcs_to_fail!(htlcs_to_fail);
 			},
 			(None, htlcs_to_fail) => {
 				if require_commitment {
@@ -3444,14 +3457,19 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					self.context.latest_monitor_update_id = monitor_update.update_id;
 					monitor_update.updates.append(&mut additional_update.updates);
 
-					log_debug!(logger, "Received a valid revoke_and_ack for channel {}. Responding with a commitment update with {} HTLCs failed.",
-						log_bytes!(self.context.channel_id()), update_fail_htlcs.len() + update_fail_malformed_htlcs.len());
+					log_debug!(logger, "Received a valid revoke_and_ack for channel {}. Responding with a commitment update with {} HTLCs failed. {} monitor update.",
+						&self.context.channel_id(),
+						update_fail_htlcs.len() + update_fail_malformed_htlcs.len(),
+						release_state_str);
+
 					self.monitor_updating_paused(false, true, false, to_forward_infos, revoked_htlcs, finalized_claimed_htlcs);
-					Ok((htlcs_to_fail, self.push_ret_blockable_mon_update(monitor_update)))
+					return_with_htlcs_to_fail!(htlcs_to_fail);
 				} else {
-					log_debug!(logger, "Received a valid revoke_and_ack for channel {} with no reply necessary.", log_bytes!(self.context.channel_id()));
+					log_debug!(logger, "Received a valid revoke_and_ack for channel {} with no reply necessary. {} monitor update.",
+						&self.context.channel_id(), release_state_str);
+
 					self.monitor_updating_paused(false, false, false, to_forward_infos, revoked_htlcs, finalized_claimed_htlcs);
-					Ok((htlcs_to_fail, self.push_ret_blockable_mon_update(monitor_update)))
+					return_with_htlcs_to_fail!(htlcs_to_fail);
 				}
 			}
 		}
@@ -3610,7 +3628,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		self.context.sent_message_awaiting_response = None;
 
 		self.context.channel_state |= ChannelState::PeerDisconnected as u32;
-		log_trace!(logger, "Peer disconnection resulted in {} remote-announced HTLC drops on channel {}", inbound_drop_count, log_bytes!(self.context.channel_id()));
+		log_trace!(logger, "Peer disconnection resulted in {} remote-announced HTLC drops on channel {}", inbound_drop_count, &self.context.channel_id());
 	}
 
 	/// Indicates that a ChannelMonitor update is in progress and has not yet been fully persisted.
@@ -3675,7 +3693,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			assert!(!self.context.is_outbound() || self.context.minimum_depth == Some(0),
 				"Funding transaction broadcast by the local client before it should have - LDK didn't do it!");
 			self.context.monitor_pending_channel_ready = false;
-			let next_per_commitment_point = self.context.holder_signer.get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
+			let next_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
 			Some(msgs::ChannelReady {
 				channel_id: self.context.channel_id(),
 				next_per_commitment_point,
@@ -3713,7 +3731,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		self.context.monitor_pending_commitment_signed = false;
 		let order = self.context.resend_order.clone();
 		log_debug!(logger, "Restored monitor updating in channel {} resulting in {}{} commitment update and {} RAA, with {} first",
-			log_bytes!(self.context.channel_id()), if funding_broadcastable.is_some() { "a funding broadcastable, " } else { "" },
+			&self.context.channel_id(), if funding_broadcastable.is_some() { "a funding broadcastable, " } else { "" },
 			if commitment_update.is_some() { "a" } else { "no" }, if raa.is_some() { "an" } else { "no" },
 			match order { RAACommitmentOrder::CommitmentFirst => "commitment", RAACommitmentOrder::RevokeAndACKFirst => "RAA"});
 		MonitorRestoreUpdates {
@@ -3730,7 +3748,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		if self.context.channel_state & (ChannelState::PeerDisconnected as u32) == ChannelState::PeerDisconnected as u32 {
 			return Err(ChannelError::Close("Peer sent update_fee when we needed a channel_reestablish".to_owned()));
 		}
-		Channel::<Signer>::check_remote_fee(&self.context.channel_type, fee_estimator, msg.feerate_per_kw, Some(self.context.feerate_per_kw), logger)?;
+		Channel::<SP>::check_remote_fee(&self.context.channel_type, fee_estimator, msg.feerate_per_kw, Some(self.context.feerate_per_kw), logger)?;
 		let feerate_over_dust_buffer = msg.feerate_per_kw > self.context.get_dust_buffer_feerate(None);
 
 		self.context.pending_update_fee = Some((msg.feerate_per_kw, FeeUpdateState::RemoteAnnounced));
@@ -3757,8 +3775,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	}
 
 	fn get_last_revoke_and_ack(&self) -> msgs::RevokeAndACK {
-		let next_per_commitment_point = self.context.holder_signer.get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
-		let per_commitment_secret = self.context.holder_signer.release_commitment_secret(self.context.cur_holder_commitment_transaction_number + 2);
+		let next_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
+		let per_commitment_secret = self.context.holder_signer.as_ref().release_commitment_secret(self.context.cur_holder_commitment_transaction_number + 2);
 		msgs::RevokeAndACK {
 			channel_id: self.context.channel_id,
 			per_commitment_secret,
@@ -3825,12 +3843,23 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		} else { None };
 
 		log_trace!(logger, "Regenerated latest commitment update in channel {} with{} {} update_adds, {} update_fulfills, {} update_fails, and {} update_fail_malformeds",
-				log_bytes!(self.context.channel_id()), if update_fee.is_some() { " update_fee," } else { "" },
+				&self.context.channel_id(), if update_fee.is_some() { " update_fee," } else { "" },
 				update_add_htlcs.len(), update_fulfill_htlcs.len(), update_fail_htlcs.len(), update_fail_malformed_htlcs.len());
 		msgs::CommitmentUpdate {
 			update_add_htlcs, update_fulfill_htlcs, update_fail_htlcs, update_fail_malformed_htlcs, update_fee,
 			commitment_signed: self.send_commitment_no_state_update(logger).expect("It looks like we failed to re-generate a commitment_signed we had previously sent?").0,
 		}
+	}
+
+	/// Gets the `Shutdown` message we should send our peer on reconnect, if any.
+	pub fn get_outbound_shutdown(&self) -> Option<msgs::Shutdown> {
+		if self.context.channel_state & (ChannelState::LocalShutdownSent as u32) != 0 {
+			assert!(self.context.shutdown_scriptpubkey.is_some());
+			Some(msgs::Shutdown {
+				channel_id: self.context.channel_id,
+				scriptpubkey: self.get_closing_scriptpubkey(),
+			})
+		} else { None }
 	}
 
 	/// May panic if some calls other than message-handling calls (which will all Err immediately)
@@ -3861,7 +3890,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		}
 
 		if msg.next_remote_commitment_number > 0 {
-			let expected_point = self.context.holder_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - msg.next_remote_commitment_number + 1, &self.context.secp_ctx);
+			let expected_point = self.context.holder_signer.as_ref().get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - msg.next_remote_commitment_number + 1, &self.context.secp_ctx);
 			let given_secret = SecretKey::from_slice(&msg.your_last_per_commitment_secret)
 				.map_err(|_| ChannelError::Close("Peer sent a garbage channel_reestablish with unparseable secret key".to_owned()))?;
 			if expected_point != PublicKey::from_secret_key(&self.context.secp_ctx, &given_secret) {
@@ -3870,8 +3899,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			if msg.next_remote_commitment_number > INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number {
 				macro_rules! log_and_panic {
 					($err_msg: expr) => {
-						log_error!(logger, $err_msg, log_bytes!(self.context.channel_id), log_pubkey!(self.context.counterparty_node_id));
-						panic!($err_msg, log_bytes!(self.context.channel_id), log_pubkey!(self.context.counterparty_node_id));
+						log_error!(logger, $err_msg, &self.context.channel_id, log_pubkey!(self.context.counterparty_node_id));
+						panic!($err_msg, &self.context.channel_id, log_pubkey!(self.context.counterparty_node_id));
 					}
 				}
 				log_and_panic!("We have fallen behind - we have received proof that if we broadcast our counterparty is going to claim all our funds.\n\
@@ -3899,13 +3928,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		self.context.channel_state &= !(ChannelState::PeerDisconnected as u32);
 		self.context.sent_message_awaiting_response = None;
 
-		let shutdown_msg = if self.context.channel_state & (ChannelState::LocalShutdownSent as u32) != 0 {
-			assert!(self.context.shutdown_scriptpubkey.is_some());
-			Some(msgs::Shutdown {
-				channel_id: self.context.channel_id,
-				scriptpubkey: self.get_closing_scriptpubkey(),
-			})
-		} else { None };
+		let shutdown_msg = self.get_outbound_shutdown();
 
 		let announcement_sigs = self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, best_block.height(), logger);
 
@@ -3926,7 +3949,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			}
 
 			// We have OurChannelReady set!
-			let next_per_commitment_point = self.context.holder_signer.get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
+			let next_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
 			return Ok(ReestablishResponses {
 				channel_ready: Some(msgs::ChannelReady {
 					channel_id: self.context.channel_id(),
@@ -3966,7 +3989,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		let channel_ready = if msg.next_local_commitment_number == 1 && INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number == 1 {
 			// We should never have to worry about MonitorUpdateInProgress resending ChannelReady
-			let next_per_commitment_point = self.context.holder_signer.get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
+			let next_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
 			Some(msgs::ChannelReady {
 				channel_id: self.context.channel_id(),
 				next_per_commitment_point,
@@ -3976,9 +3999,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 		if msg.next_local_commitment_number == next_counterparty_commitment_number {
 			if required_revoke.is_some() {
-				log_debug!(logger, "Reconnected channel {} with only lost outbound RAA", log_bytes!(self.context.channel_id()));
+				log_debug!(logger, "Reconnected channel {} with only lost outbound RAA", &self.context.channel_id());
 			} else {
-				log_debug!(logger, "Reconnected channel {} with no loss", log_bytes!(self.context.channel_id()));
+				log_debug!(logger, "Reconnected channel {} with no loss", &self.context.channel_id());
 			}
 
 			Ok(ReestablishResponses {
@@ -3989,9 +4012,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			})
 		} else if msg.next_local_commitment_number == next_counterparty_commitment_number - 1 {
 			if required_revoke.is_some() {
-				log_debug!(logger, "Reconnected channel {} with lost outbound RAA and lost remote commitment tx", log_bytes!(self.context.channel_id()));
+				log_debug!(logger, "Reconnected channel {} with lost outbound RAA and lost remote commitment tx", &self.context.channel_id());
 			} else {
-				log_debug!(logger, "Reconnected channel {} with only lost remote commitment tx", log_bytes!(self.context.channel_id()));
+				log_debug!(logger, "Reconnected channel {} with only lost remote commitment tx", &self.context.channel_id());
 			}
 
 			if self.context.channel_state & (ChannelState::MonitorUpdateInProgress as u32) != 0 {
@@ -4110,20 +4133,24 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		log_trace!(logger, "Proposing initial closing_signed for our counterparty with a fee range of {}-{} sat (with initial proposal {} sats)",
 			our_min_fee, our_max_fee, total_fee_satoshis);
 
-		let sig = self.context.holder_signer
-			.sign_closing_transaction(&closing_tx, &self.context.secp_ctx)
-			.map_err(|()| ChannelError::Close("Failed to get signature for closing transaction.".to_owned()))?;
+		match &self.context.holder_signer {
+			ChannelSignerType::Ecdsa(ecdsa) => {
+				let sig = ecdsa
+					.sign_closing_transaction(&closing_tx, &self.context.secp_ctx)
+					.map_err(|()| ChannelError::Close("Failed to get signature for closing transaction.".to_owned()))?;
 
-		self.context.last_sent_closing_fee = Some((total_fee_satoshis, sig.clone()));
-		Ok((Some(msgs::ClosingSigned {
-			channel_id: self.context.channel_id,
-			fee_satoshis: total_fee_satoshis,
-			signature: sig,
-			fee_range: Some(msgs::ClosingSignedFeeRange {
-				min_fee_satoshis: our_min_fee,
-				max_fee_satoshis: our_max_fee,
-			}),
-		}), None))
+				self.context.last_sent_closing_fee = Some((total_fee_satoshis, sig.clone()));
+				Ok((Some(msgs::ClosingSigned {
+					channel_id: self.context.channel_id,
+					fee_satoshis: total_fee_satoshis,
+					signature: sig,
+					fee_range: Some(msgs::ClosingSignedFeeRange {
+						min_fee_satoshis: our_min_fee,
+						max_fee_satoshis: our_max_fee,
+					}),
+				}), None))
+			}
+		}
 	}
 
 	// Marks a channel as waiting for a response from the counterparty. If it's not received
@@ -4148,10 +4175,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		*ticks_elapsed >= DISCONNECT_PEER_AWAITING_RESPONSE_TICKS
 	}
 
-	pub fn shutdown<SP: Deref>(
+	pub fn shutdown(
 		&mut self, signer_provider: &SP, their_features: &InitFeatures, msg: &msgs::Shutdown
 	) -> Result<(Option<msgs::Shutdown>, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>), ChannelError>
-	where SP::Target: SignerProvider
 	{
 		if self.context.channel_state & (ChannelState::PeerDisconnected as u32) == ChannelState::PeerDisconnected as u32 {
 			return Err(ChannelError::Close("Peer sent shutdown when we needed a channel_reestablish".to_owned()));
@@ -4340,27 +4366,31 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					self.build_closing_transaction($new_fee, false)
 				};
 
-				let sig = self.context.holder_signer
-					.sign_closing_transaction(&closing_tx, &self.context.secp_ctx)
-					.map_err(|_| ChannelError::Close("External signer refused to sign closing transaction".to_owned()))?;
+				return match &self.context.holder_signer {
+					ChannelSignerType::Ecdsa(ecdsa) => {
+						let sig = ecdsa
+							.sign_closing_transaction(&closing_tx, &self.context.secp_ctx)
+							.map_err(|_| ChannelError::Close("External signer refused to sign closing transaction".to_owned()))?;
 
-				let signed_tx = if $new_fee == msg.fee_satoshis {
-					self.context.channel_state = ChannelState::ShutdownComplete as u32;
-					self.context.update_time_counter += 1;
-					let tx = self.build_signed_closing_transaction(&closing_tx, &msg.signature, &sig);
-					Some(tx)
-				} else { None };
+						let signed_tx = if $new_fee == msg.fee_satoshis {
+							self.context.channel_state = ChannelState::ShutdownComplete as u32;
+							self.context.update_time_counter += 1;
+							let tx = self.build_signed_closing_transaction(&closing_tx, &msg.signature, &sig);
+							Some(tx)
+						} else { None };
 
-				self.context.last_sent_closing_fee = Some((used_fee, sig.clone()));
-				return Ok((Some(msgs::ClosingSigned {
-					channel_id: self.context.channel_id,
-					fee_satoshis: used_fee,
-					signature: sig,
-					fee_range: Some(msgs::ClosingSignedFeeRange {
-						min_fee_satoshis: our_min_fee,
-						max_fee_satoshis: our_max_fee,
-					}),
-				}), signed_tx))
+						self.context.last_sent_closing_fee = Some((used_fee, sig.clone()));
+						Ok((Some(msgs::ClosingSigned {
+							channel_id: self.context.channel_id,
+							fee_satoshis: used_fee,
+							signature: sig,
+							fee_range: Some(msgs::ClosingSignedFeeRange {
+								min_fee_satoshis: our_min_fee,
+								max_fee_satoshis: our_max_fee,
+							}),
+						}), signed_tx))
+					}
+				}
 			}
 		}
 
@@ -4471,7 +4501,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	}
 
 	#[cfg(test)]
-	pub fn get_signer(&self) -> &Signer {
+	pub fn get_signer(&self) -> &ChannelSignerType<<SP::Target as SignerProvider>::Signer> {
 		&self.context.holder_signer
 	}
 
@@ -4656,7 +4686,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			if self.context.channel_state & (ChannelState::MonitorUpdateInProgress as u32) == 0 {
 				if self.context.channel_state & (ChannelState::PeerDisconnected as u32) == 0 {
 					let next_per_commitment_point =
-						self.context.holder_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - 1, &self.context.secp_ctx);
+						self.context.holder_signer.as_ref().get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - 1, &self.context.secp_ctx);
 					return Some(msgs::ChannelReady {
 						channel_id: self.context.channel_id,
 						next_per_commitment_point,
@@ -4725,14 +4755,14 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 					// send it immediately instead of waiting for a best_block_updated call (which
 					// may have already happened for this block).
 					if let Some(channel_ready) = self.check_get_channel_ready(height) {
-						log_info!(logger, "Sending a channel_ready to our peer for channel {}", log_bytes!(self.context.channel_id));
+						log_info!(logger, "Sending a channel_ready to our peer for channel {}", &self.context.channel_id);
 						let announcement_sigs = self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, height, logger);
 						return Ok((Some(channel_ready), announcement_sigs));
 					}
 				}
 				for inp in tx.input.iter() {
 					if inp.previous_output == funding_txo.into_bitcoin_outpoint() {
-						log_info!(logger, "Detected channel-closing tx {} spending {}:{}, closing channel {}", tx.txid(), inp.previous_output.txid, inp.previous_output.vout, log_bytes!(self.context.channel_id()));
+						log_info!(logger, "Detected channel-closing tx {} spending {}:{}, closing channel {}", tx.txid(), inp.previous_output.txid, inp.previous_output.vout, &self.context.channel_id());
 						return Err(ClosureReason::CommitmentTxConfirmed);
 					}
 				}
@@ -4794,7 +4824,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			let announcement_sigs = if let Some((genesis_block_hash, node_signer, user_config)) = genesis_node_signer {
 				self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, height, logger)
 			} else { None };
-			log_info!(logger, "Sending a channel_ready to our peer for channel {}", log_bytes!(self.context.channel_id));
+			log_info!(logger, "Sending a channel_ready to our peer for channel {}", &self.context.channel_id);
 			return Ok((Some(channel_ready), timed_out_htlcs, announcement_sigs));
 		}
 
@@ -4825,7 +4855,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			}
 		} else if !self.context.is_outbound() && self.context.funding_tx_confirmed_in.is_none() &&
 				height >= self.context.channel_creation_height + FUNDING_CONF_DEADLINE_BLOCKS {
-			log_info!(logger, "Closing channel {} due to funding timeout", log_bytes!(self.context.channel_id));
+			log_info!(logger, "Closing channel {} due to funding timeout", &self.context.channel_id);
 			// If funding_tx_confirmed_in is unset, the channel must not be active
 			assert!(non_shutdown_state <= ChannelState::ChannelReady as u32);
 			assert_eq!(non_shutdown_state & ChannelState::OurChannelReady as u32, 0);
@@ -4935,7 +4965,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			return None;
 		}
 
-		log_trace!(logger, "Creating an announcement_signatures message for channel {}", log_bytes!(self.context.channel_id()));
+		log_trace!(logger, "Creating an announcement_signatures message for channel {}", &self.context.channel_id());
 		let announcement = match self.get_channel_announcement(node_signer, genesis_block_hash, user_config) {
 			Ok(a) => a,
 			Err(e) => {
@@ -4950,26 +4980,30 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			},
 			Ok(v) => v
 		};
-		let our_bitcoin_sig = match self.context.holder_signer.sign_channel_announcement_with_funding_key(&announcement, &self.context.secp_ctx) {
-			Err(_) => {
-				log_error!(logger, "Signer rejected channel_announcement signing. Channel will not be announced!");
-				return None;
-			},
-			Ok(v) => v
-		};
-		let short_channel_id = match self.context.get_short_channel_id() {
-			Some(scid) => scid,
-			None => return None,
-		};
+		match &self.context.holder_signer {
+			ChannelSignerType::Ecdsa(ecdsa) => {
+				let our_bitcoin_sig = match ecdsa.sign_channel_announcement_with_funding_key(&announcement, &self.context.secp_ctx) {
+					Err(_) => {
+						log_error!(logger, "Signer rejected channel_announcement signing. Channel will not be announced!");
+						return None;
+					},
+					Ok(v) => v
+				};
+				let short_channel_id = match self.context.get_short_channel_id() {
+					Some(scid) => scid,
+					None => return None,
+				};
 
-		self.context.announcement_sigs_state = AnnouncementSigsState::MessageSent;
+				self.context.announcement_sigs_state = AnnouncementSigsState::MessageSent;
 
-		Some(msgs::AnnouncementSignatures {
-			channel_id: self.context.channel_id(),
-			short_channel_id,
-			node_signature: our_node_sig,
-			bitcoin_signature: our_bitcoin_sig,
-		})
+				Some(msgs::AnnouncementSignatures {
+					channel_id: self.context.channel_id(),
+					short_channel_id,
+					node_signature: our_node_sig,
+					bitcoin_signature: our_bitcoin_sig,
+				})
+			}
+		}
 	}
 
 	/// Signs the given channel announcement, returning a ChannelError::Ignore if no keys are
@@ -4984,15 +5018,19 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 
 			let our_node_sig = node_signer.sign_gossip_message(msgs::UnsignedGossipMessage::ChannelAnnouncement(&announcement))
 				.map_err(|_| ChannelError::Ignore("Failed to generate node signature for channel_announcement".to_owned()))?;
-			let our_bitcoin_sig = self.context.holder_signer.sign_channel_announcement_with_funding_key(&announcement, &self.context.secp_ctx)
-				.map_err(|_| ChannelError::Ignore("Signer rejected channel_announcement".to_owned()))?;
-			Ok(msgs::ChannelAnnouncement {
-				node_signature_1: if were_node_one { our_node_sig } else { their_node_sig },
-				node_signature_2: if were_node_one { their_node_sig } else { our_node_sig },
-				bitcoin_signature_1: if were_node_one { our_bitcoin_sig } else { their_bitcoin_sig },
-				bitcoin_signature_2: if were_node_one { their_bitcoin_sig } else { our_bitcoin_sig },
-				contents: announcement,
-			})
+			match &self.context.holder_signer {
+				ChannelSignerType::Ecdsa(ecdsa) => {
+					let our_bitcoin_sig = ecdsa.sign_channel_announcement_with_funding_key(&announcement, &self.context.secp_ctx)
+						.map_err(|_| ChannelError::Ignore("Signer rejected channel_announcement".to_owned()))?;
+					Ok(msgs::ChannelAnnouncement {
+						node_signature_1: if were_node_one { our_node_sig } else { their_node_sig },
+						node_signature_2: if were_node_one { their_node_sig } else { our_node_sig },
+						bitcoin_signature_1: if were_node_one { our_bitcoin_sig } else { their_bitcoin_sig },
+						bitcoin_signature_2: if were_node_one { their_bitcoin_sig } else { our_bitcoin_sig },
+						contents: announcement,
+					})
+				}
+			}
 		} else {
 			Err(ChannelError::Ignore("Attempted to sign channel announcement before we'd received announcement_signatures".to_string()))
 		}
@@ -5062,10 +5100,10 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let dummy_pubkey = PublicKey::from_slice(&pk).unwrap();
 		let remote_last_secret = if self.context.cur_counterparty_commitment_transaction_number + 1 < INITIAL_COMMITMENT_NUMBER {
 			let remote_last_secret = self.context.commitment_secrets.get_secret(self.context.cur_counterparty_commitment_transaction_number + 2).unwrap();
-			log_trace!(logger, "Enough info to generate a Data Loss Protect with per_commitment_secret {} for channel {}", log_bytes!(remote_last_secret), log_bytes!(self.context.channel_id()));
+			log_trace!(logger, "Enough info to generate a Data Loss Protect with per_commitment_secret {} for channel {}", log_bytes!(remote_last_secret), &self.context.channel_id());
 			remote_last_secret
 		} else {
-			log_info!(logger, "Sending a data_loss_protect with no previous remote per_commitment_secret for channel {}", log_bytes!(self.context.channel_id()));
+			log_info!(logger, "Sending a data_loss_protect with no previous remote per_commitment_secret for channel {}", &self.context.channel_id());
 			[0;32]
 		};
 		self.mark_awaiting_response();
@@ -5181,7 +5219,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		}
 
 		let need_holding_cell = (self.context.channel_state & (ChannelState::AwaitingRemoteRevoke as u32 | ChannelState::MonitorUpdateInProgress as u32)) != 0;
-		log_debug!(logger, "Pushing new outbound HTLC for {} msat {}", amount_msat,
+		log_debug!(logger, "Pushing new outbound HTLC with hash {} for {} msat {}",
+			payment_hash, amount_msat,
 			if force_holding_cell { "into holding cell" }
 			else if need_holding_cell { "into holding cell as we're awaiting an RAA or monitor" }
 			else { "to peer" });
@@ -5237,13 +5276,13 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				Some(InboundHTLCState::AwaitingAnnouncedRemoteRevoke(forward_info.clone()))
 			} else { None };
 			if let Some(state) = new_state {
-				log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", log_bytes!(htlc.payment_hash.0));
+				log_trace!(logger, " ...promoting inbound AwaitingRemoteRevokeToAnnounce {} to AwaitingAnnouncedRemoteRevoke", &htlc.payment_hash);
 				htlc.state = state;
 			}
 		}
 		for htlc in self.context.pending_outbound_htlcs.iter_mut() {
 			if let &mut OutboundHTLCState::AwaitingRemoteRevokeToRemove(ref mut outcome) = &mut htlc.state {
-				log_trace!(logger, " ...promoting outbound AwaitingRemoteRevokeToRemove {} to AwaitingRemovedRemoteRevoke", log_bytes!(htlc.payment_hash.0));
+				log_trace!(logger, " ...promoting outbound AwaitingRemoteRevokeToRemove {} to AwaitingRemovedRemoteRevoke", &htlc.payment_hash);
 				// Grab the preimage, if it exists, instead of cloning
 				let mut reason = OutboundHTLCOutcome::Success(None);
 				mem::swap(outcome, &mut reason);
@@ -5260,7 +5299,9 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		}
 		self.context.resend_order = RAACommitmentOrder::RevokeAndACKFirst;
 
-		let (counterparty_commitment_txid, mut htlcs_ref) = self.build_commitment_no_state_update(logger);
+		let (mut htlcs_ref, counterparty_commitment_tx) =
+			self.build_commitment_no_state_update(logger);
+		let counterparty_commitment_txid = counterparty_commitment_tx.trust().txid();
 		let htlcs: Vec<(HTLCOutputInCommitment, Option<Box<HTLCSource>>)> =
 			htlcs_ref.drain(..).map(|(htlc, htlc_source)| (htlc, htlc_source.map(|source_ref| Box::new(source_ref.clone())))).collect();
 
@@ -5275,17 +5316,23 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 				commitment_txid: counterparty_commitment_txid,
 				htlc_outputs: htlcs.clone(),
 				commitment_number: self.context.cur_counterparty_commitment_transaction_number,
-				their_per_commitment_point: self.context.counterparty_cur_commitment_point.unwrap()
+				their_per_commitment_point: self.context.counterparty_cur_commitment_point.unwrap(),
+				feerate_per_kw: Some(counterparty_commitment_tx.feerate_per_kw()),
+				to_broadcaster_value_sat: Some(counterparty_commitment_tx.to_broadcaster_value_sat()),
+				to_countersignatory_value_sat: Some(counterparty_commitment_tx.to_countersignatory_value_sat()),
 			}]
 		};
 		self.context.channel_state |= ChannelState::AwaitingRemoteRevoke as u32;
 		monitor_update
 	}
 
-	fn build_commitment_no_state_update<L: Deref>(&self, logger: &L) -> (Txid, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>) where L::Target: Logger {
+	fn build_commitment_no_state_update<L: Deref>(&self, logger: &L)
+	-> (Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>, CommitmentTransaction)
+	where L::Target: Logger
+	{
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
-		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
+		let counterparty_commitment_tx = commitment_stats.tx;
 
 		#[cfg(any(test, fuzzing))]
 		{
@@ -5305,7 +5352,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 			}
 		}
 
-		(counterparty_commitment_txid, commitment_stats.htlcs_included)
+		(commitment_stats.htlcs_included, counterparty_commitment_tx)
 	}
 
 	/// Only fails in case of signer rejection. Used for channel_reestablish commitment_signed
@@ -5318,40 +5365,45 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let commitment_stats = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
 		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
-		let (signature, htlc_signatures);
 
-		{
-			let mut htlcs = Vec::with_capacity(commitment_stats.htlcs_included.len());
-			for &(ref htlc, _) in commitment_stats.htlcs_included.iter() {
-				htlcs.push(htlc);
-			}
+		match &self.context.holder_signer {
+			ChannelSignerType::Ecdsa(ecdsa) => {
+				let (signature, htlc_signatures);
 
-			let res = self.context.holder_signer.sign_counterparty_commitment(&commitment_stats.tx, commitment_stats.preimages, &self.context.secp_ctx)
-				.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?;
-			signature = res.0;
-			htlc_signatures = res.1;
+				{
+					let mut htlcs = Vec::with_capacity(commitment_stats.htlcs_included.len());
+					for &(ref htlc, _) in commitment_stats.htlcs_included.iter() {
+						htlcs.push(htlc);
+					}
 
-			log_trace!(logger, "Signed remote commitment tx {} (txid {}) with redeemscript {} -> {} in channel {}",
-				encode::serialize_hex(&commitment_stats.tx.trust().built_transaction().transaction),
-				&counterparty_commitment_txid, encode::serialize_hex(&self.context.get_funding_redeemscript()),
-				log_bytes!(signature.serialize_compact()[..]), log_bytes!(self.context.channel_id()));
+					let res = ecdsa.sign_counterparty_commitment(&commitment_stats.tx, commitment_stats.preimages, &self.context.secp_ctx)
+						.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?;
+					signature = res.0;
+					htlc_signatures = res.1;
 
-			for (ref htlc_sig, ref htlc) in htlc_signatures.iter().zip(htlcs) {
-				log_trace!(logger, "Signed remote HTLC tx {} with redeemscript {} with pubkey {} -> {} in channel {}",
-					encode::serialize_hex(&chan_utils::build_htlc_transaction(&counterparty_commitment_txid, commitment_stats.feerate_per_kw, self.context.get_holder_selected_contest_delay(), htlc, &self.context.channel_type, &counterparty_keys.broadcaster_delayed_payment_key, &counterparty_keys.revocation_key)),
-					encode::serialize_hex(&chan_utils::get_htlc_redeemscript(&htlc, &self.context.channel_type, &counterparty_keys)),
-					log_bytes!(counterparty_keys.broadcaster_htlc_key.serialize()),
-					log_bytes!(htlc_sig.serialize_compact()[..]), log_bytes!(self.context.channel_id()));
+					log_trace!(logger, "Signed remote commitment tx {} (txid {}) with redeemscript {} -> {} in channel {}",
+						encode::serialize_hex(&commitment_stats.tx.trust().built_transaction().transaction),
+						&counterparty_commitment_txid, encode::serialize_hex(&self.context.get_funding_redeemscript()),
+						log_bytes!(signature.serialize_compact()[..]), &self.context.channel_id());
+
+					for (ref htlc_sig, ref htlc) in htlc_signatures.iter().zip(htlcs) {
+						log_trace!(logger, "Signed remote HTLC tx {} with redeemscript {} with pubkey {} -> {} in channel {}",
+							encode::serialize_hex(&chan_utils::build_htlc_transaction(&counterparty_commitment_txid, commitment_stats.feerate_per_kw, self.context.get_holder_selected_contest_delay(), htlc, &self.context.channel_type, &counterparty_keys.broadcaster_delayed_payment_key, &counterparty_keys.revocation_key)),
+							encode::serialize_hex(&chan_utils::get_htlc_redeemscript(&htlc, &self.context.channel_type, &counterparty_keys)),
+							log_bytes!(counterparty_keys.broadcaster_htlc_key.serialize()),
+							log_bytes!(htlc_sig.serialize_compact()[..]), &self.context.channel_id());
+					}
+				}
+
+				Ok((msgs::CommitmentSigned {
+					channel_id: self.context.channel_id,
+					signature,
+					htlc_signatures,
+					#[cfg(taproot)]
+					partial_signature_with_nonce: None,
+				}, (counterparty_commitment_txid, commitment_stats.htlcs_included)))
 			}
 		}
-
-		Ok((msgs::CommitmentSigned {
-			channel_id: self.context.channel_id,
-			signature,
-			htlc_signatures,
-			#[cfg(taproot)]
-			partial_signature_with_nonce: None,
-		}, (counterparty_commitment_txid, commitment_stats.htlcs_included)))
 	}
 
 	/// Adds a pending outbound HTLC to this channel, and builds a new remote commitment
@@ -5397,10 +5449,10 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	///
 	/// May jump to the channel being fully shutdown (see [`Self::is_shutdown`]) in which case no
 	/// [`ChannelMonitorUpdate`] will be returned).
-	pub fn get_shutdown<SP: Deref>(&mut self, signer_provider: &SP, their_features: &InitFeatures,
+	pub fn get_shutdown(&mut self, signer_provider: &SP, their_features: &InitFeatures,
 		target_feerate_sats_per_kw: Option<u32>, override_shutdown_script: Option<ShutdownScript>)
 	-> Result<(msgs::Shutdown, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>), APIError>
-	where SP::Target: SignerProvider {
+	{
 		for htlc in self.context.pending_outbound_htlcs.iter() {
 			if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
 				return Err(APIError::APIMisuseError{err: "Cannot begin shutdown with pending HTLCs. Process pending events first".to_owned()});
@@ -5511,20 +5563,19 @@ impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 }
 
 /// A not-yet-funded outbound (from holder) channel using V1 channel establishment.
-pub(super) struct OutboundV1Channel<Signer: ChannelSigner> {
-	pub context: ChannelContext<Signer>,
+pub(super) struct OutboundV1Channel<SP: Deref> where SP::Target: SignerProvider {
+	pub context: ChannelContext<SP>,
 	pub unfunded_context: UnfundedChannelContext,
 }
 
-impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
-	pub fn new<ES: Deref, SP: Deref, F: Deref>(
+impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
+	pub fn new<ES: Deref, F: Deref>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
 		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
 		outbound_scid_alias: u64
-	) -> Result<OutboundV1Channel<Signer>, APIError>
+	) -> Result<OutboundV1Channel<SP>, APIError>
 	where ES::Target: EntropySource,
-	      SP::Target: SignerProvider<Signer = Signer>,
-	      F::Target: FeeEstimator,
+	      F::Target: FeeEstimator
 	{
 		let holder_selected_contest_delay = config.channel_handshake_config.our_to_self_delay;
 		let channel_keys_id = signer_provider.generate_channel_keys_id(false, channel_value_satoshis, user_id);
@@ -5588,7 +5639,7 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 			Err(_) => return Err(APIError::ChannelUnavailable { err: "Failed to get destination script".to_owned()}),
 		};
 
-		let temporary_channel_id = entropy_source.get_secure_random_bytes();
+		let temporary_channel_id = ChannelId::temporary_from_entropy_source(entropy_source);
 
 		Ok(Self {
 			context: ChannelContext {
@@ -5613,7 +5664,7 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 
 				latest_monitor_update_id: 0,
 
-				holder_signer,
+				holder_signer: ChannelSignerType::Ecdsa(holder_signer),
 				shutdown_scriptpubkey,
 				destination_script,
 
@@ -5648,8 +5699,6 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 				pending_counterparty_closing_signed: None,
 				closing_fee_limits: None,
 				target_closing_feerate_sats_per_kw: None,
-
-				inbound_awaiting_accept: false,
 
 				funding_tx_confirmed_in: None,
 				funding_tx_confirmation_height: 0,
@@ -5724,8 +5773,13 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 	fn get_funding_created_signature<L: Deref>(&mut self, logger: &L) -> Result<Signature, ChannelError> where L::Target: Logger {
 		let counterparty_keys = self.context.build_remote_transaction_keys();
 		let counterparty_initial_commitment_tx = self.context.build_commitment_transaction(self.context.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, false, logger).tx;
-		Ok(self.context.holder_signer.sign_counterparty_commitment(&counterparty_initial_commitment_tx, Vec::new(), &self.context.secp_ctx)
-				.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?.0)
+		match &self.context.holder_signer {
+			// TODO (taproot|arik): move match into calling method for Taproot
+			ChannelSignerType::Ecdsa(ecdsa) => {
+				Ok(ecdsa.sign_counterparty_commitment(&counterparty_initial_commitment_tx, Vec::new(), &self.context.secp_ctx)
+					.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?.0)
+			}
+		}
 	}
 
 	/// Updates channel state with knowledge of the funding transaction's txid/index, and generates
@@ -5736,7 +5790,7 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 	/// Do NOT broadcast the funding transaction until after a successful funding_signed call!
 	/// If an Err is returned, it is a ChannelError::Close.
 	pub fn get_funding_created<L: Deref>(mut self, funding_transaction: Transaction, funding_txo: OutPoint, logger: &L)
-	-> Result<(Channel<Signer>, msgs::FundingCreated), (Self, ChannelError)> where L::Target: Logger {
+	-> Result<(Channel<SP>, msgs::FundingCreated), (Self, ChannelError)> where L::Target: Logger {
 		if !self.context.is_outbound() {
 			panic!("Tried to create outbound funding_created message on an inbound channel!");
 		}
@@ -5750,7 +5804,7 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 		}
 
 		self.context.channel_transaction_parameters.funding_outpoint = Some(funding_txo);
-		self.context.holder_signer.provide_channel_parameters(&self.context.channel_transaction_parameters);
+		self.context.holder_signer.as_mut().provide_channel_parameters(&self.context.channel_transaction_parameters);
 
 		let signature = match self.get_funding_created_signature(logger) {
 			Ok(res) => res,
@@ -5856,7 +5910,7 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 			panic!("Tried to send an open_channel for a channel that has already advanced");
 		}
 
-		let first_per_commitment_point = self.context.holder_signer.get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
+		let first_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
 		let keys = self.context.get_holder_pubkeys();
 
 		msgs::OpenChannel {
@@ -6019,22 +6073,21 @@ impl<Signer: WriteableEcdsaChannelSigner> OutboundV1Channel<Signer> {
 }
 
 /// A not-yet-funded inbound (from counterparty) channel using V1 channel establishment.
-pub(super) struct InboundV1Channel<Signer: ChannelSigner> {
-	pub context: ChannelContext<Signer>,
+pub(super) struct InboundV1Channel<SP: Deref> where SP::Target: SignerProvider {
+	pub context: ChannelContext<SP>,
 	pub unfunded_context: UnfundedChannelContext,
 }
 
-impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
+impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 	/// Creates a new channel from a remote sides' request for one.
 	/// Assumes chain_hash has already been checked and corresponds with what we expect!
-	pub fn new<ES: Deref, SP: Deref, F: Deref, L: Deref>(
+	pub fn new<ES: Deref, F: Deref, L: Deref>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
 		counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
 		their_features: &InitFeatures, msg: &msgs::OpenChannel, user_id: u128, config: &UserConfig,
-		current_chain_height: u32, logger: &L, outbound_scid_alias: u64
-	) -> Result<InboundV1Channel<Signer>, ChannelError>
+		current_chain_height: u32, logger: &L, is_0conf: bool,
+	) -> Result<InboundV1Channel<SP>, ChannelError>
 		where ES::Target: EntropySource,
-			  SP::Target: SignerProvider<Signer = Signer>,
 			  F::Target: FeeEstimator,
 			  L::Target: Logger,
 	{
@@ -6104,7 +6157,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		if msg.htlc_minimum_msat >= full_channel_value_msat {
 			return Err(ChannelError::Close(format!("Minimum htlc value ({}) was larger than full channel value ({})", msg.htlc_minimum_msat, full_channel_value_msat)));
 		}
-		Channel::<Signer>::check_remote_fee(&channel_type, fee_estimator, msg.feerate_per_kw, None, logger)?;
+		Channel::<SP>::check_remote_fee(&channel_type, fee_estimator, msg.feerate_per_kw, None, logger)?;
 
 		let max_counterparty_selected_contest_delay = u16::min(config.channel_handshake_limits.their_to_self_delay, MAX_LOCAL_BREAKDOWN_TIMEOUT);
 		if msg.to_self_delay > max_counterparty_selected_contest_delay {
@@ -6221,6 +6274,12 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		let mut secp_ctx = Secp256k1::new();
 		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
 
+		let minimum_depth = if is_0conf {
+			Some(0)
+		} else {
+			Some(cmp::max(config.channel_handshake_config.minimum_depth, 1))
+		};
+
 		let chan = Self {
 			context: ChannelContext {
 				user_id,
@@ -6243,7 +6302,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 
 				latest_monitor_update_id: 0,
 
-				holder_signer,
+				holder_signer: ChannelSignerType::Ecdsa(holder_signer),
 				shutdown_scriptpubkey,
 				destination_script,
 
@@ -6279,8 +6338,6 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 				closing_fee_limits: None,
 				target_closing_feerate_sats_per_kw: None,
 
-				inbound_awaiting_accept: true,
-
 				funding_tx_confirmed_in: None,
 				funding_tx_confirmation_height: 0,
 				short_channel_id: None,
@@ -6298,7 +6355,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 				holder_htlc_minimum_msat: if config.channel_handshake_config.our_htlc_minimum_msat == 0 { 1 } else { config.channel_handshake_config.our_htlc_minimum_msat },
 				counterparty_max_accepted_htlcs: msg.max_accepted_htlcs,
 				holder_max_accepted_htlcs: cmp::min(config.channel_handshake_config.our_max_accepted_htlcs, MAX_HTLCS),
-				minimum_depth: Some(cmp::max(config.channel_handshake_config.minimum_depth, 1)),
+				minimum_depth,
 
 				counterparty_forwarding_info: None,
 
@@ -6337,7 +6394,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 				sent_message_awaiting_response: None,
 
 				latest_inbound_scid_alias: None,
-				outbound_scid_alias,
+				outbound_scid_alias: 0,
 
 				channel_pending_event_emitted: false,
 				channel_ready_event_emitted: false,
@@ -6356,21 +6413,11 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		Ok(chan)
 	}
 
-	pub fn is_awaiting_accept(&self) -> bool {
-		self.context.inbound_awaiting_accept
-	}
-
-	/// Sets this channel to accepting 0conf, must be done before `get_accept_channel`
-	pub fn set_0conf(&mut self) {
-		assert!(self.context.inbound_awaiting_accept);
-		self.context.minimum_depth = Some(0);
-	}
-
 	/// Marks an inbound channel as accepted and generates a [`msgs::AcceptChannel`] message which
 	/// should be sent back to the counterparty node.
 	///
 	/// [`msgs::AcceptChannel`]: crate::ln::msgs::AcceptChannel
-	pub fn accept_inbound_channel(&mut self, user_id: u128) -> msgs::AcceptChannel {
+	pub fn accept_inbound_channel(&mut self) -> msgs::AcceptChannel {
 		if self.context.is_outbound() {
 			panic!("Tried to send accept_channel for an outbound channel?");
 		}
@@ -6380,12 +6427,6 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		if self.context.cur_holder_commitment_transaction_number != INITIAL_COMMITMENT_NUMBER {
 			panic!("Tried to send an accept_channel for a channel that has already advanced");
 		}
-		if !self.context.inbound_awaiting_accept {
-			panic!("The inbound channel has already been accepted");
-		}
-
-		self.context.user_id = user_id;
-		self.context.inbound_awaiting_accept = false;
 
 		self.generate_accept_channel_message()
 	}
@@ -6396,7 +6437,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 	///
 	/// [`msgs::AcceptChannel`]: crate::ln::msgs::AcceptChannel
 	fn generate_accept_channel_message(&self) -> msgs::AcceptChannel {
-		let first_per_commitment_point = self.context.holder_signer.get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
+		let first_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
 		let keys = self.context.get_holder_pubkeys();
 
 		msgs::AcceptChannel {
@@ -6433,7 +6474,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		self.generate_accept_channel_message()
 	}
 
-	fn funding_created_signature<L: Deref>(&mut self, sig: &Signature, logger: &L) -> Result<(Txid, CommitmentTransaction, Signature), ChannelError> where L::Target: Logger {
+	fn funding_created_signature<L: Deref>(&mut self, sig: &Signature, logger: &L) -> Result<(CommitmentTransaction, CommitmentTransaction, Signature), ChannelError> where L::Target: Logger {
 		let funding_script = self.context.get_funding_redeemscript();
 
 		let keys = self.context.build_holder_transaction_keys(self.context.cur_holder_commitment_transaction_number);
@@ -6446,7 +6487,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 			log_trace!(logger, "Checking funding_created tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} for channel {}.",
 				log_bytes!(sig.serialize_compact()[..]), log_bytes!(self.context.counterparty_funding_pubkey().serialize()),
 				encode::serialize_hex(&initial_commitment_bitcoin_tx.transaction), log_bytes!(sighash[..]),
-				encode::serialize_hex(&funding_script), log_bytes!(self.context.channel_id()));
+				encode::serialize_hex(&funding_script), &self.context.channel_id());
 			secp_check!(self.context.secp_ctx.verify_ecdsa(&sighash, &sig, self.context.counterparty_funding_pubkey()), "Invalid funding_created signature from peer".to_owned());
 		}
 
@@ -6456,20 +6497,24 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
 		log_trace!(logger, "Initial counterparty tx for channel {} is: txid {} tx {}",
-			log_bytes!(self.context.channel_id()), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
+			&self.context.channel_id(), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
 
-		let counterparty_signature = self.context.holder_signer.sign_counterparty_commitment(&counterparty_initial_commitment_tx, Vec::new(), &self.context.secp_ctx)
-				.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?.0;
+		match &self.context.holder_signer {
+			// TODO (arik): move match into calling method for Taproot
+			ChannelSignerType::Ecdsa(ecdsa) => {
+				let counterparty_signature = ecdsa.sign_counterparty_commitment(&counterparty_initial_commitment_tx, Vec::new(), &self.context.secp_ctx)
+					.map_err(|_| ChannelError::Close("Failed to get signatures for new commitment_signed".to_owned()))?.0;
 
-		// We sign "counterparty" commitment transaction, allowing them to broadcast the tx if they wish.
-		Ok((counterparty_initial_bitcoin_tx.txid, initial_commitment_tx, counterparty_signature))
+				// We sign "counterparty" commitment transaction, allowing them to broadcast the tx if they wish.
+				Ok((counterparty_initial_commitment_tx, initial_commitment_tx, counterparty_signature))
+			}
+		}
 	}
 
-	pub fn funding_created<SP: Deref, L: Deref>(
+	pub fn funding_created<L: Deref>(
 		mut self, msg: &msgs::FundingCreated, best_block: BestBlock, signer_provider: &SP, logger: &L
-	) -> Result<(Channel<Signer>, msgs::FundingSigned, ChannelMonitor<Signer>), (Self, ChannelError)>
+	) -> Result<(Channel<SP>, msgs::FundingSigned, ChannelMonitor<<SP::Target as SignerProvider>::Signer>), (Self, ChannelError)>
 	where
-		SP::Target: SignerProvider<Signer = Signer>,
 		L::Target: Logger
 	{
 		if self.context.is_outbound() {
@@ -6481,9 +6526,6 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 			// channel.
 			return Err((self, ChannelError::Close("Received funding_created after we got the channel!".to_owned())));
 		}
-		if self.context.inbound_awaiting_accept {
-			return Err((self, ChannelError::Close("FundingCreated message received before the channel was accepted".to_owned())));
-		}
 		if self.context.commitment_secrets.get_min_seen_secret() != (1 << 48) ||
 				self.context.cur_counterparty_commitment_transaction_number != INITIAL_COMMITMENT_NUMBER ||
 				self.context.cur_holder_commitment_transaction_number != INITIAL_COMMITMENT_NUMBER {
@@ -6494,9 +6536,9 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		self.context.channel_transaction_parameters.funding_outpoint = Some(funding_txo);
 		// This is an externally observable change before we finish all our checks.  In particular
 		// funding_created_signature may fail.
-		self.context.holder_signer.provide_channel_parameters(&self.context.channel_transaction_parameters);
+		self.context.holder_signer.as_mut().provide_channel_parameters(&self.context.channel_transaction_parameters);
 
-		let (counterparty_initial_commitment_txid, initial_commitment_tx, signature) = match self.funding_created_signature(&msg.signature, logger) {
+		let (counterparty_initial_commitment_tx, initial_commitment_tx, signature) = match self.funding_created_signature(&msg.signature, logger) {
 			Ok(res) => res,
 			Err(ChannelError::Close(e)) => {
 				self.context.channel_transaction_parameters.funding_outpoint = None;
@@ -6517,7 +6559,7 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 			self.context.counterparty_funding_pubkey()
 		);
 
-		if let Err(_) = self.context.holder_signer.validate_holder_commitment(&holder_commitment_tx, Vec::new()) {
+		if let Err(_) = self.context.holder_signer.as_ref().validate_holder_commitment(&holder_commitment_tx, Vec::new()) {
 			return Err((self, ChannelError::Close("Failed to validate our commitment".to_owned())));
 		}
 
@@ -6537,14 +6579,19 @@ impl<Signer: WriteableEcdsaChannelSigner> InboundV1Channel<Signer> {
 		                                          obscure_factor,
 		                                          holder_commitment_tx, best_block, self.context.counterparty_node_id);
 
-		channel_monitor.provide_latest_counterparty_commitment_tx(counterparty_initial_commitment_txid, Vec::new(), self.context.cur_counterparty_commitment_transaction_number, self.context.counterparty_cur_commitment_point.unwrap(), logger);
+		channel_monitor.provide_initial_counterparty_commitment_tx(
+			counterparty_initial_commitment_tx.trust().txid(), Vec::new(),
+			self.context.cur_counterparty_commitment_transaction_number,
+			self.context.counterparty_cur_commitment_point.unwrap(), self.context.feerate_per_kw,
+			counterparty_initial_commitment_tx.to_broadcaster_value_sat(),
+			counterparty_initial_commitment_tx.to_countersignatory_value_sat(), logger);
 
 		self.context.channel_state = ChannelState::FundingSent as u32;
 		self.context.channel_id = funding_txo.to_channel_id();
 		self.context.cur_counterparty_commitment_transaction_number -= 1;
 		self.context.cur_holder_commitment_transaction_number -= 1;
 
-		log_info!(logger, "Generated funding_signed for peer for channel {}", log_bytes!(self.context.channel_id()));
+		log_info!(logger, "Generated funding_signed for peer for channel {}", &self.context.channel_id());
 
 		// Promote the channel to a full-fledged one now that we have updated the state and have a
 		// `ChannelMonitor`.
@@ -6621,7 +6668,7 @@ impl Readable for AnnouncementSigsState {
 	}
 }
 
-impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
+impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
 		// Note that we write out as if remove_uncommitted_htlcs_and_mark_paused had just been
 		// called.
@@ -6646,7 +6693,8 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 		self.context.latest_monitor_update_id.write(writer)?;
 
 		let mut key_data = VecWriter(Vec::new());
-		self.context.holder_signer.write(&mut key_data)?;
+		// TODO (taproot|arik): Introduce serialization distinction for non-ECDSA signers.
+		self.context.holder_signer.as_ecdsa().expect("Only ECDSA signers may be serialized").write(&mut key_data)?;
 		assert!(key_data.0.len() < core::usize::MAX);
 		assert!(key_data.0.len() < core::u32::MAX as usize);
 		(key_data.0.len() as u32).write(writer)?;
@@ -6945,7 +6993,7 @@ impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 }
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
-impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)> for Channel<<SP::Target as SignerProvider>::Signer>
+impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)> for Channel<SP>
 		where
 			ES::Target: EntropySource,
 			SP::Target: SignerProvider
@@ -7213,7 +7261,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 
 		let mut user_id_high_opt: Option<u64> = None;
 		let mut channel_keys_id: Option<[u8; 32]> = None;
-		let mut temporary_channel_id: Option<[u8; 32]> = None;
+		let mut temporary_channel_id: Option<ChannelId> = None;
 		let mut holder_max_accepted_htlcs: Option<u16> = None;
 
 		let mut blocked_monitor_updates = Some(Vec::new());
@@ -7344,7 +7392,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 
 				latest_monitor_update_id,
 
-				holder_signer,
+				holder_signer: ChannelSignerType::Ecdsa(holder_signer),
 				shutdown_scriptpubkey,
 				destination_script,
 
@@ -7382,8 +7430,6 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 				pending_counterparty_closing_signed: None,
 				closing_fee_limits: None,
 				target_closing_feerate_sats_per_kw,
-
-				inbound_awaiting_accept: false,
 
 				funding_tx_confirmed_in,
 				funding_tx_confirmation_height,
@@ -7471,10 +7517,9 @@ mod tests {
 	use crate::chain::transaction::OutPoint;
 	use crate::routing::router::Path;
 	use crate::util::config::UserConfig;
-	use crate::util::enforcing_trait_impls::EnforcingSigner;
 	use crate::util::errors::APIError;
 	use crate::util::test_utils;
-	use crate::util::test_utils::OnGetShutdownScriptpubkey;
+	use crate::util::test_utils::{OnGetShutdownScriptpubkey, TestKeysInterface};
 	use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
 	use bitcoin::secp256k1::ffi::Signature as FFISignature;
 	use bitcoin::secp256k1::{SecretKey,PublicKey};
@@ -7507,7 +7552,7 @@ mod tests {
 		// arithmetic, causing a panic with debug assertions enabled.
 		let fee_est = TestFeeEstimator { fee_est: 42 };
 		let bounded_fee_estimator = LowerBoundedFeeEstimator::new(&fee_est);
-		assert!(Channel::<InMemorySigner>::check_remote_fee(
+		assert!(Channel::<&TestKeysInterface>::check_remote_fee(
 			&ChannelTypeFeatures::only_static_remote_key(), &bounded_fee_estimator,
 			u32::max_value(), None, &&test_utils::TestLogger::new()).is_err());
 	}
@@ -7568,7 +7613,7 @@ mod tests {
 		let secp_ctx = Secp256k1::new();
 		let node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		match OutboundV1Channel::<EnforcingSigner>::new(&LowerBoundedFeeEstimator::new(&TestFeeEstimator { fee_est: 253 }), &&keys_provider, &&keys_provider, node_id, &features, 10000000, 100000, 42, &config, 0, 42) {
+		match OutboundV1Channel::<&TestKeysInterface>::new(&LowerBoundedFeeEstimator::new(&TestFeeEstimator { fee_est: 253 }), &&keys_provider, &&keys_provider, node_id, &features, 10000000, 100000, 42, &config, 0, 42) {
 			Err(APIError::IncompatibleShutdownScript { script }) => {
 				assert_eq!(script.into_inner(), non_v0_segwit_shutdown_script.into_inner());
 			},
@@ -7591,7 +7636,7 @@ mod tests {
 
 		let node_a_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let node_a_chan = OutboundV1Channel::<EnforcingSigner>::new(&bounded_fee_estimator, &&keys_provider, &&keys_provider, node_a_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let node_a_chan = OutboundV1Channel::<&TestKeysInterface>::new(&bounded_fee_estimator, &&keys_provider, &&keys_provider, node_a_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		// Now change the fee so we can check that the fee in the open_channel message is the
 		// same as the old fee.
@@ -7618,16 +7663,16 @@ mod tests {
 		// Create Node A's channel pointing to Node B's pubkey
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut node_a_chan = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut node_a_chan = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		// Create Node B's channel by receiving Node A's open_channel message
 		// Make sure A's dust limit is as we expect.
 		let open_channel_msg = node_a_chan.get_open_channel(genesis_block(network).header.block_hash());
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
-		let mut node_b_chan = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, 42).unwrap();
+		let mut node_b_chan = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false).unwrap();
 
 		// Node B --> Node A: accept channel, explicitly setting B's dust limit.
-		let mut accept_channel_msg = node_b_chan.accept_inbound_channel(0);
+		let mut accept_channel_msg = node_b_chan.accept_inbound_channel();
 		accept_channel_msg.dust_limit_satoshis = 546;
 		node_a_chan.accept_channel(&accept_channel_msg, &config.channel_handshake_limits, &channelmanager::provided_init_features(&config)).unwrap();
 		node_a_chan.context.holder_dust_limit_satoshis = 1560;
@@ -7699,7 +7744,7 @@ mod tests {
 
 		let node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut chan = OutboundV1Channel::<EnforcingSigner>::new(&fee_est, &&keys_provider, &&keys_provider, node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut chan = OutboundV1Channel::<&TestKeysInterface>::new(&fee_est, &&keys_provider, &&keys_provider, node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		let commitment_tx_fee_0_htlcs = commit_tx_fee_msat(chan.context.feerate_per_kw, 0, chan.context.get_channel_type());
 		let commitment_tx_fee_1_htlc = commit_tx_fee_msat(chan.context.feerate_per_kw, 1, chan.context.get_channel_type());
@@ -7748,15 +7793,15 @@ mod tests {
 		// Create Node A's channel pointing to Node B's pubkey
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut node_a_chan = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut node_a_chan = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		// Create Node B's channel by receiving Node A's open_channel message
 		let open_channel_msg = node_a_chan.get_open_channel(chain_hash);
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
-		let mut node_b_chan = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, 42).unwrap();
+		let mut node_b_chan = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false).unwrap();
 
 		// Node B --> Node A: accept channel
-		let accept_channel_msg = node_b_chan.accept_inbound_channel(0);
+		let accept_channel_msg = node_b_chan.accept_inbound_channel();
 		node_a_chan.accept_channel(&accept_channel_msg, &config.channel_handshake_limits, &channelmanager::provided_init_features(&config)).unwrap();
 
 		// Node A --> Node B: funding created
@@ -7811,12 +7856,12 @@ mod tests {
 		// Test that `OutboundV1Channel::new` creates a channel with the correct value for
 		// `holder_max_htlc_value_in_flight_msat`, when configured with a valid percentage value,
 		// which is set to the lower bound + 1 (2%) of the `channel_value`.
-		let chan_1 = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_2_percent), 10000000, 100000, 42, &config_2_percent, 0, 42).unwrap();
+		let chan_1 = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_2_percent), 10000000, 100000, 42, &config_2_percent, 0, 42).unwrap();
 		let chan_1_value_msat = chan_1.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_1.context.holder_max_htlc_value_in_flight_msat, (chan_1_value_msat as f64 * 0.02) as u64);
 
 		// Test with the upper bound - 1 of valid values (99%).
-		let chan_2 = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_99_percent), 10000000, 100000, 42, &config_99_percent, 0, 42).unwrap();
+		let chan_2 = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_99_percent), 10000000, 100000, 42, &config_99_percent, 0, 42).unwrap();
 		let chan_2_value_msat = chan_2.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_2.context.holder_max_htlc_value_in_flight_msat, (chan_2_value_msat as f64 * 0.99) as u64);
 
@@ -7825,38 +7870,38 @@ mod tests {
 		// Test that `InboundV1Channel::new` creates a channel with the correct value for
 		// `holder_max_htlc_value_in_flight_msat`, when configured with a valid percentage value,
 		// which is set to the lower bound - 1 (2%) of the `channel_value`.
-		let chan_3 = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_2_percent), &channelmanager::provided_init_features(&config_2_percent), &chan_1_open_channel_msg, 7, &config_2_percent, 0, &&logger, 42).unwrap();
+		let chan_3 = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_2_percent), &channelmanager::provided_init_features(&config_2_percent), &chan_1_open_channel_msg, 7, &config_2_percent, 0, &&logger, /*is_0conf=*/false).unwrap();
 		let chan_3_value_msat = chan_3.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_3.context.holder_max_htlc_value_in_flight_msat, (chan_3_value_msat as f64 * 0.02) as u64);
 
 		// Test with the upper bound - 1 of valid values (99%).
-		let chan_4 = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_99_percent), &channelmanager::provided_init_features(&config_99_percent), &chan_1_open_channel_msg, 7, &config_99_percent, 0, &&logger, 42).unwrap();
+		let chan_4 = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_99_percent), &channelmanager::provided_init_features(&config_99_percent), &chan_1_open_channel_msg, 7, &config_99_percent, 0, &&logger, /*is_0conf=*/false).unwrap();
 		let chan_4_value_msat = chan_4.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_4.context.holder_max_htlc_value_in_flight_msat, (chan_4_value_msat as f64 * 0.99) as u64);
 
 		// Test that `OutboundV1Channel::new` uses the lower bound of the configurable percentage values (1%)
 		// if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a value less than 1.
-		let chan_5 = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_0_percent), 10000000, 100000, 42, &config_0_percent, 0, 42).unwrap();
+		let chan_5 = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_0_percent), 10000000, 100000, 42, &config_0_percent, 0, 42).unwrap();
 		let chan_5_value_msat = chan_5.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_5.context.holder_max_htlc_value_in_flight_msat, (chan_5_value_msat as f64 * 0.01) as u64);
 
 		// Test that `OutboundV1Channel::new` uses the upper bound of the configurable percentage values
 		// (100%) if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a larger value
 		// than 100.
-		let chan_6 = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_101_percent), 10000000, 100000, 42, &config_101_percent, 0, 42).unwrap();
+		let chan_6 = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_101_percent), 10000000, 100000, 42, &config_101_percent, 0, 42).unwrap();
 		let chan_6_value_msat = chan_6.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_6.context.holder_max_htlc_value_in_flight_msat, chan_6_value_msat);
 
 		// Test that `InboundV1Channel::new` uses the lower bound of the configurable percentage values (1%)
 		// if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a value less than 1.
-		let chan_7 = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_0_percent), &channelmanager::provided_init_features(&config_0_percent), &chan_1_open_channel_msg, 7, &config_0_percent, 0, &&logger, 42).unwrap();
+		let chan_7 = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_0_percent), &channelmanager::provided_init_features(&config_0_percent), &chan_1_open_channel_msg, 7, &config_0_percent, 0, &&logger, /*is_0conf=*/false).unwrap();
 		let chan_7_value_msat = chan_7.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_7.context.holder_max_htlc_value_in_flight_msat, (chan_7_value_msat as f64 * 0.01) as u64);
 
 		// Test that `InboundV1Channel::new` uses the upper bound of the configurable percentage values
 		// (100%) if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a larger value
 		// than 100.
-		let chan_8 = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_101_percent), &channelmanager::provided_init_features(&config_101_percent), &chan_1_open_channel_msg, 7, &config_101_percent, 0, &&logger, 42).unwrap();
+		let chan_8 = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_101_percent), &channelmanager::provided_init_features(&config_101_percent), &chan_1_open_channel_msg, 7, &config_101_percent, 0, &&logger, /*is_0conf=*/false).unwrap();
 		let chan_8_value_msat = chan_8.context.channel_value_satoshis * 1000;
 		assert_eq!(chan_8.context.holder_max_htlc_value_in_flight_msat, chan_8_value_msat);
 	}
@@ -7896,7 +7941,7 @@ mod tests {
 
 		let mut outbound_node_config = UserConfig::default();
 		outbound_node_config.channel_handshake_config.their_channel_reserve_proportional_millionths = (outbound_selected_channel_reserve_perc * 1_000_000.0) as u32;
-		let chan = OutboundV1Channel::<EnforcingSigner>::new(&&fee_est, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&outbound_node_config), channel_value_satoshis, 100_000, 42, &outbound_node_config, 0, 42).unwrap();
+		let chan = OutboundV1Channel::<&TestKeysInterface>::new(&&fee_est, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&outbound_node_config), channel_value_satoshis, 100_000, 42, &outbound_node_config, 0, 42).unwrap();
 
 		let expected_outbound_selected_chan_reserve = cmp::max(MIN_THEIR_CHAN_RESERVE_SATOSHIS, (chan.context.channel_value_satoshis as f64 * outbound_selected_channel_reserve_perc) as u64);
 		assert_eq!(chan.context.holder_selected_channel_reserve_satoshis, expected_outbound_selected_chan_reserve);
@@ -7906,7 +7951,7 @@ mod tests {
 		inbound_node_config.channel_handshake_config.their_channel_reserve_proportional_millionths = (inbound_selected_channel_reserve_perc * 1_000_000.0) as u32;
 
 		if outbound_selected_channel_reserve_perc + inbound_selected_channel_reserve_perc < 1.0 {
-			let chan_inbound_node = InboundV1Channel::<EnforcingSigner>::new(&&fee_est, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&inbound_node_config), &channelmanager::provided_init_features(&outbound_node_config), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, 42).unwrap();
+			let chan_inbound_node = InboundV1Channel::<&TestKeysInterface>::new(&&fee_est, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&inbound_node_config), &channelmanager::provided_init_features(&outbound_node_config), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, /*is_0conf=*/false).unwrap();
 
 			let expected_inbound_selected_chan_reserve = cmp::max(MIN_THEIR_CHAN_RESERVE_SATOSHIS, (chan.context.channel_value_satoshis as f64 * inbound_selected_channel_reserve_perc) as u64);
 
@@ -7914,7 +7959,7 @@ mod tests {
 			assert_eq!(chan_inbound_node.context.counterparty_selected_channel_reserve_satoshis.unwrap(), expected_outbound_selected_chan_reserve);
 		} else {
 			// Channel Negotiations failed
-			let result = InboundV1Channel::<EnforcingSigner>::new(&&fee_est, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&inbound_node_config), &channelmanager::provided_init_features(&outbound_node_config), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, 42);
+			let result = InboundV1Channel::<&TestKeysInterface>::new(&&fee_est, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&inbound_node_config), &channelmanager::provided_init_features(&outbound_node_config), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, /*is_0conf=*/false);
 			assert!(result.is_err());
 		}
 	}
@@ -7933,16 +7978,16 @@ mod tests {
 		// Create Node A's channel pointing to Node B's pubkey
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut node_a_chan = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut node_a_chan = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		// Create Node B's channel by receiving Node A's open_channel message
 		// Make sure A's dust limit is as we expect.
 		let open_channel_msg = node_a_chan.get_open_channel(genesis_block(network).header.block_hash());
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
-		let mut node_b_chan = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, 42).unwrap();
+		let mut node_b_chan = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false).unwrap();
 
 		// Node B --> Node A: accept channel, explicitly setting B's dust limit.
-		let mut accept_channel_msg = node_b_chan.accept_inbound_channel(0);
+		let mut accept_channel_msg = node_b_chan.accept_inbound_channel();
 		accept_channel_msg.dust_limit_satoshis = 546;
 		node_a_chan.accept_channel(&accept_channel_msg, &config.channel_handshake_limits, &channelmanager::provided_init_features(&config)).unwrap();
 		node_a_chan.context.holder_dust_limit_satoshis = 1560;
@@ -8033,7 +8078,7 @@ mod tests {
 		let counterparty_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let mut config = UserConfig::default();
 		config.channel_handshake_config.announced_channel = false;
-		let mut chan = OutboundV1Channel::<InMemorySigner>::new(&LowerBoundedFeeEstimator::new(&feeest), &&keys_provider, &&keys_provider, counterparty_node_id, &channelmanager::provided_init_features(&config), 10_000_000, 0, 42, &config, 0, 42).unwrap(); // Nothing uses their network key in this test
+		let mut chan = OutboundV1Channel::<&Keys>::new(&LowerBoundedFeeEstimator::new(&feeest), &&keys_provider, &&keys_provider, counterparty_node_id, &channelmanager::provided_init_features(&config), 10_000_000, 0, 42, &config, 0, 42).unwrap(); // Nothing uses their network key in this test
 		chan.context.holder_dust_limit_satoshis = 546;
 		chan.context.counterparty_selected_channel_reserve_satoshis = Some(0); // Filled in in accept_channel
 
@@ -8066,10 +8111,10 @@ mod tests {
 		// We can't just use build_holder_transaction_keys here as the per_commitment_secret is not
 		// derived from a commitment_seed, so instead we copy it here and call
 		// build_commitment_transaction.
-		let delayed_payment_base = &chan.context.holder_signer.pubkeys().delayed_payment_basepoint;
+		let delayed_payment_base = &chan.context.holder_signer.as_ref().pubkeys().delayed_payment_basepoint;
 		let per_commitment_secret = SecretKey::from_slice(&hex::decode("1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100").unwrap()[..]).unwrap();
 		let per_commitment_point = PublicKey::from_secret_key(&secp_ctx, &per_commitment_secret);
-		let htlc_basepoint = &chan.context.holder_signer.pubkeys().htlc_basepoint;
+		let htlc_basepoint = &chan.context.holder_signer.as_ref().pubkeys().htlc_basepoint;
 		let keys = TxCreationKeys::derive_new(&secp_ctx, &per_commitment_point, delayed_payment_base, htlc_basepoint, &counterparty_pubkeys.revocation_basepoint, &counterparty_pubkeys.htlc_basepoint);
 
 		macro_rules! test_commitment {
@@ -8121,7 +8166,7 @@ mod tests {
 					commitment_tx.clone(),
 					counterparty_signature,
 					counterparty_htlc_sigs,
-					&chan.context.holder_signer.pubkeys().funding_pubkey,
+					&chan.context.holder_signer.as_ref().pubkeys().funding_pubkey,
 					chan.context.counterparty_funding_pubkey()
 				);
 				let (holder_sig, htlc_sigs) = signer.sign_holder_commitment_and_htlcs(&holder_commitment_tx, &secp_ctx).unwrap();
@@ -8766,7 +8811,7 @@ mod tests {
 
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let node_a_chan = OutboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider,
+		let node_a_chan = OutboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider,
 			node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		let mut channel_type_features = ChannelTypeFeatures::only_static_remote_key();
@@ -8775,9 +8820,9 @@ mod tests {
 		let mut open_channel_msg = node_a_chan.get_open_channel(genesis_block(network).header.block_hash());
 		open_channel_msg.channel_type = Some(channel_type_features);
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
-		let res = InboundV1Channel::<EnforcingSigner>::new(&feeest, &&keys_provider, &&keys_provider,
+		let res = InboundV1Channel::<&TestKeysInterface>::new(&feeest, &&keys_provider, &&keys_provider,
 			node_b_node_id, &channelmanager::provided_channel_type_features(&config),
-			&channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, 42);
+			&channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false);
 		assert!(res.is_ok());
 	}
 
@@ -8799,7 +8844,7 @@ mod tests {
 
 		// It is not enough for just the initiator to signal `option_anchors_zero_fee_htlc_tx`, both
 		// need to signal it.
-		let channel_a = OutboundV1Channel::<EnforcingSigner>::new(
+		let channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
 			&channelmanager::provided_init_features(&UserConfig::default()), 10000000, 100000, 42,
 			&config, 0, 42
@@ -8810,16 +8855,16 @@ mod tests {
 		expected_channel_type.set_static_remote_key_required();
 		expected_channel_type.set_anchors_zero_fee_htlc_tx_required();
 
-		let channel_a = OutboundV1Channel::<EnforcingSigner>::new(
+		let channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
 			&channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42
 		).unwrap();
 
 		let open_channel_msg = channel_a.get_open_channel(genesis_block(network).header.block_hash());
-		let channel_b = InboundV1Channel::<EnforcingSigner>::new(
+		let channel_b = InboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
 			&channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config),
-			&open_channel_msg, 7, &config, 0, &&logger, 42
+			&open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false
 		).unwrap();
 
 		assert_eq!(channel_a.context.channel_type, expected_channel_type);
@@ -8847,7 +8892,7 @@ mod tests {
 		let raw_init_features = static_remote_key_required | simple_anchors_required;
 		let init_features_with_simple_anchors = InitFeatures::from_le_bytes(raw_init_features.to_le_bytes().to_vec());
 
-		let channel_a = OutboundV1Channel::<EnforcingSigner>::new(
+		let channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
 			&channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42
 		).unwrap();
@@ -8858,10 +8903,10 @@ mod tests {
 
 		// Since A supports both `static_remote_key` and `option_anchors`, but B only accepts
 		// `static_remote_key`, it will fail the channel.
-		let channel_b = InboundV1Channel::<EnforcingSigner>::new(
+		let channel_b = InboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
 			&channelmanager::provided_channel_type_features(&config), &init_features_with_simple_anchors,
-			&open_channel_msg, 7, &config, 0, &&logger, 42
+			&open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false
 		);
 		assert!(channel_b.is_err());
 	}
@@ -8893,7 +8938,7 @@ mod tests {
 		// First, we'll try to open a channel between A and B where A requests a channel type for
 		// the original `option_anchors` feature (non zero fee htlc tx). This should be rejected by
 		// B as it's not supported by LDK.
-		let channel_a = OutboundV1Channel::<EnforcingSigner>::new(
+		let channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
 			&channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42
 		).unwrap();
@@ -8901,10 +8946,10 @@ mod tests {
 		let mut open_channel_msg = channel_a.get_open_channel(genesis_block(network).header.block_hash());
 		open_channel_msg.channel_type = Some(simple_anchors_channel_type.clone());
 
-		let res = InboundV1Channel::<EnforcingSigner>::new(
+		let res = InboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
 			&channelmanager::provided_channel_type_features(&config), &simple_anchors_init,
-			&open_channel_msg, 7, &config, 0, &&logger, 42
+			&open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false
 		);
 		assert!(res.is_err());
 
@@ -8912,17 +8957,17 @@ mod tests {
 		// `anchors_zero_fee_htlc_tx`. B is malicious and tries to downgrade the channel type to the
 		// original `option_anchors` feature, which should be rejected by A as it's not supported by
 		// LDK.
-		let mut channel_a = OutboundV1Channel::<EnforcingSigner>::new(
+		let mut channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b, &simple_anchors_init,
 			10000000, 100000, 42, &config, 0, 42
 		).unwrap();
 
 		let open_channel_msg = channel_a.get_open_channel(genesis_block(network).header.block_hash());
 
-		let channel_b = InboundV1Channel::<EnforcingSigner>::new(
+		let channel_b = InboundV1Channel::<&TestKeysInterface>::new(
 			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
 			&channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config),
-			&open_channel_msg, 7, &config, 0, &&logger, 42
+			&open_channel_msg, 7, &config, 0, &&logger, /*is_0conf=*/false
 		).unwrap();
 
 		let mut accept_channel_msg = channel_b.get_accept_channel_message();

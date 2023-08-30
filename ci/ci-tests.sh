@@ -32,35 +32,38 @@ PIN_RELEASE_DEPS # pin the release dependencies in our main workspace
 # The proc-macro2 crate switched to Rust edition 2021 starting with v1.0.66, i.e., has MSRV of 1.56
 [ "$RUSTC_MINOR_VERSION" -lt 56 ] && cargo update -p proc-macro2 --precise "1.0.65" --verbose
 
+# The memchr crate switched to an MSRV of 1.60 starting with v2.6.0
+[ "$RUSTC_MINOR_VERSION" -lt 60 ] && cargo update -p memchr --precise "2.5.0" --verbose
+
 [ "$LDK_COVERAGE_BUILD" != "" ] && export RUSTFLAGS="-C link-dead-code"
 
 export RUST_BACKTRACE=1
 
 echo -e "\n\nBuilding and testing all workspace crates..."
-cargo build --verbose --color always
 cargo test --verbose --color always
+cargo build --verbose --color always
 
 echo -e "\n\nBuilding and testing Block Sync Clients with features"
 pushd lightning-block-sync
-cargo build --verbose --color always --features rest-client
 cargo test --verbose --color always --features rest-client
-cargo build --verbose --color always --features rpc-client
+cargo build --verbose --color always --features rest-client
 cargo test --verbose --color always --features rpc-client
-cargo build --verbose --color always --features rpc-client,rest-client
+cargo build --verbose --color always --features rpc-client
 cargo test --verbose --color always --features rpc-client,rest-client
-cargo build --verbose --color always --features rpc-client,rest-client,tokio
+cargo build --verbose --color always --features rpc-client,rest-client
 cargo test --verbose --color always --features rpc-client,rest-client,tokio
+cargo build --verbose --color always --features rpc-client,rest-client,tokio
 popd
 
 if [[ $RUSTC_MINOR_VERSION -gt 67 && "$HOST_PLATFORM" != *windows* ]]; then
 	echo -e "\n\nBuilding and testing Transaction Sync Clients with features"
 	pushd lightning-transaction-sync
-	cargo build --verbose --color always --features esplora-blocking
 	cargo test --verbose --color always --features esplora-blocking
-	cargo build --verbose --color always --features esplora-async
+	cargo build --verbose --color always --features esplora-blocking
 	cargo test --verbose --color always --features esplora-async
-	cargo build --verbose --color always --features esplora-async-https
+	cargo build --verbose --color always --features esplora-async
 	cargo test --verbose --color always --features esplora-async-https
+	cargo build --verbose --color always --features esplora-async-https
 	popd
 fi
 

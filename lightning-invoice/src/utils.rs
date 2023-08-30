@@ -191,7 +191,7 @@ where
 	};
 
 	log_trace!(logger, "Creating phantom invoice from {} participating nodes with payment hash {}",
-		phantom_route_hints.len(), log_bytes!(payment_hash.0));
+		phantom_route_hints.len(), &payment_hash);
 
 	let mut invoice = invoice
 		.duration_since_epoch(duration_since_epoch)
@@ -534,7 +534,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 		return Err(SignOrCreationError::CreationError(CreationError::MinFinalCltvExpiryDeltaTooShort));
 	}
 
-	log_trace!(logger, "Creating invoice with payment hash {}", log_bytes!(payment_hash.0));
+	log_trace!(logger, "Creating invoice with payment hash {}", &payment_hash);
 
 	let invoice = match description {
 		Bolt11InvoiceDescription::Direct(description) => {
@@ -627,7 +627,7 @@ where
 	log_trace!(logger, "Considering {} channels for invoice route hints", channels.len());
 	for channel in channels.into_iter().filter(|chan| chan.is_channel_ready) {
 		if channel.get_inbound_payment_scid().is_none() || channel.counterparty.forwarding_info.is_none() {
-			log_trace!(logger, "Ignoring channel {} for invoice route hints", log_bytes!(channel.channel_id));
+			log_trace!(logger, "Ignoring channel {} for invoice route hints", &channel.channel_id);
 			continue;
 		}
 
@@ -641,7 +641,7 @@ where
 				// If any public channel exists, return no hints and let the sender
 				// look at the public channels instead.
 				log_trace!(logger, "Not including channels in invoice route hints on account of public channel {}",
-					log_bytes!(channel.channel_id));
+					&channel.channel_id);
 				return vec![].into_iter().take(MAX_CHANNEL_HINTS).map(route_hint_from_channel);
 			}
 		}
@@ -681,18 +681,18 @@ where
 					log_trace!(logger,
 						"Preferring counterparty {} channel {} (SCID {:?}, {} msats) over {} (SCID {:?}, {} msats) for invoice route hints",
 						log_pubkey!(channel.counterparty.node_id),
-						log_bytes!(channel.channel_id), channel.short_channel_id,
+						&channel.channel_id, channel.short_channel_id,
 						channel.inbound_capacity_msat,
-						log_bytes!(entry.get().channel_id), entry.get().short_channel_id,
+						&entry.get().channel_id, entry.get().short_channel_id,
 						current_max_capacity);
 					entry.insert(channel);
 				} else {
 					log_trace!(logger,
 						"Preferring counterparty {} channel {} (SCID {:?}, {} msats) over {} (SCID {:?}, {} msats) for invoice route hints",
 						log_pubkey!(channel.counterparty.node_id),
-						log_bytes!(entry.get().channel_id), entry.get().short_channel_id,
+						&entry.get().channel_id, entry.get().short_channel_id,
 						current_max_capacity,
-						log_bytes!(channel.channel_id), channel.short_channel_id,
+						&channel.channel_id, channel.short_channel_id,
 						channel.inbound_capacity_msat);
 				}
 			}
@@ -731,14 +731,14 @@ where
 
 			if include_channel {
 				log_trace!(logger, "Including channel {} in invoice route hints",
-					log_bytes!(channel.channel_id));
+					&channel.channel_id);
 			} else if !has_enough_capacity {
 				log_trace!(logger, "Ignoring channel {} without enough capacity for invoice route hints",
-					log_bytes!(channel.channel_id));
+					&channel.channel_id);
 			} else {
 				debug_assert!(!channel.is_usable || (has_pub_unconf_chan && !channel.is_public));
 				log_trace!(logger, "Ignoring channel {} with disconnected peer",
-					log_bytes!(channel.channel_id));
+					&channel.channel_id);
 			}
 
 			include_channel
@@ -1373,22 +1373,7 @@ mod test {
 		assert_eq!(other_events.borrow().len(), 1);
 		check_payment_claimable(&other_events.borrow()[0], payment_hash, payment_secret, payment_amt, payment_preimage_opt, invoice.recover_payee_pub_key());
 		do_claim_payment_along_route(&nodes[0], &[&vec!(&nodes[fwd_idx])[..]], false, payment_preimage);
-		let events = nodes[0].node.get_and_clear_pending_events();
-		assert_eq!(events.len(), 2);
-		match events[0] {
-			Event::PaymentSent { payment_preimage: ref ev_preimage, payment_hash: ref ev_hash, ref fee_paid_msat, .. } => {
-				assert_eq!(payment_preimage, *ev_preimage);
-				assert_eq!(payment_hash, *ev_hash);
-				assert_eq!(fee_paid_msat, &Some(0));
-			},
-			_ => panic!("Unexpected event")
-		}
-		match events[1] {
-			Event::PaymentPathSuccessful { payment_hash: hash, .. } => {
-				assert_eq!(hash, Some(payment_hash));
-			},
-			_ => panic!("Unexpected event")
-		}
+		expect_payment_sent(&nodes[0], payment_preimage, None, true, true);
 	}
 
 	#[test]
