@@ -2308,7 +2308,6 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 		if let Some(random_key) = keys.choose(&mut rng) {
 			if let Some(peer) = peers.get(*random_key) {
 				let mut p = peer.lock().unwrap();
-				log_trace!(self.logger, "!!!!Enqueueing message {:?} to {}", message, log_pubkey!(p.their_node_id.unwrap().0));
 				self.enqueue_message(&mut p, message);
 			}
 		}
